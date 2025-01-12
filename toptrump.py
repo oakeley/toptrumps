@@ -18,7 +18,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class TopTrumpsDeck:
-    """Handles deck loading and preprocessing"""
+    """Handles deck loading and preprocessing with improved normalization"""
     def __init__(self, csv_path: str):
         self.csv_path = csv_path
         self.cards = []
@@ -29,69 +29,82 @@ class TopTrumpsDeck:
     def _load_deck(self):
         try:
             df = pd.read_csv(self.csv_path)
-            if 'Individual' not in df.columns and 'Name' in df.columns:
-                df = df.rename(columns={'Name': 'Individual'})
             
-            if 'Individual' not in df.columns:
-                raise ValueError("Deck must have 'Individual' or 'Name' column")
+            if len(df.columns) < 2:
+                raise ValueError("Deck must have at least two columns")
             
-            # First pass: identify numeric columns and analyze distributions
+            # Always use first column as identifier
+            identifier_col = df.columns[0]
+            
+            # All other columns are potential attributes
             valid_attributes = []
             attribute_stats = {}
             
-            for col in df.columns:
-                if col == 'Individual':
-                    continue
-                    
-                # Replace 'n/a' with np.nan
-                df[col] = df[col].replace('n/a', np.nan)
+            for col in df.columns[1:]:  # Skip the first (identifier) column
+                # Create a working copy of the column
+                working_series = df[col].copy()
+                
+                # Convert special values
+                working_series = working_series.replace('n/a', '0')
+                working_series = working_series.replace('Yes', '100')
+                working_series = working_series.replace('No', '0')
+                working_series = working_series.replace('yes', '100')
+                working_series = working_series.replace('no', '0')
                 
                 # Try to convert to numeric
-                numeric_series = pd.to_numeric(df[col], errors='coerce')
+                numeric_series = pd.to_numeric(working_series, errors='coerce')
                 
-                # Check if column is mostly numeric
-                if numeric_series.notna().sum() > len(df) * 0.5:
+                # Check if column is mostly numeric (>50% valid numbers)
+                valid_numeric_count = numeric_series.notna().sum()
+                if valid_numeric_count > len(df) * 0.5:
                     valid_attributes.append(col)
                     
-                    # Calculate distribution statistics
+                    # Fill NaN values with 0
+                    numeric_series = numeric_series.fillna(0)
+                    
+                    # Calculate basic statistics
                     stats = {
-                        'mean': numeric_series.mean(),
-                        'std': numeric_series.std(),
-                        'min': numeric_series.min(),
-                        'max': numeric_series.max(),
-                        'range': numeric_series.max() - numeric_series.min(),
-                        'variance': numeric_series.var()
+                        'mean': float(numeric_series.mean()),
+                        'std': max(float(numeric_series.std()), 1e-6),  # Avoid zero std
+                        'min': float(numeric_series.min()),
+                        'max': float(numeric_series.max())
                     }
+                    
+                    # Calculate range after basic stats
+                    stats['range'] = max(stats['max'] - stats['min'], 1e-6)  # Avoid zero range
+                    
                     attribute_stats[col] = stats
                     
-                    # Fill missing values with minimum
-                    min_val = numeric_series[numeric_series.notna()].min()
-                    df.loc[numeric_series.isna(), col] = min_val
+                    # Store the processed numeric values back in the dataframe
+                    df[col] = numeric_series
             
             self.attributes = valid_attributes
             self.attribute_stats = attribute_stats
             
-            # Normalize values considering distribution characteristics
+            # Normalize values
             for attr in self.attributes:
-                numeric_vals = pd.to_numeric(df[attr], errors='coerce')
+                numeric_vals = df[attr].astype(float)
                 stats = attribute_stats[attr]
                 
-                # Use z-score normalization if distribution is well-behaved
-                if stats['std'] > 0 and stats['range'] > 0:
-                    df[attr] = ((numeric_vals - stats['mean']) / stats['std']) * 20 + 50
-                else:
-                    # Fallback to min-max scaling
-                    df[attr] = ((numeric_vals - stats['min']) / max(stats['range'], 1e-6)) * 100
+                # Use min-max scaling
+                df[attr] = ((numeric_vals - stats['min']) / stats['range']) * 100
                 
-                # Clip values to 0-100 range
+                # Ensure values are within 0-100 range
                 df[attr] = df[attr].clip(0, 100)
+                
+                # Update stats with normalized values
+                norm_series = df[attr]
+                attribute_stats[attr].update({
+                    'norm_mean': float(norm_series.mean()),
+                    'norm_std': float(norm_series.std())
+                })
             
             # Convert deck to list of dictionaries
             for _, row in df.iterrows():
                 card = {
-                    'name': row['Individual'],
-                    'stats': {attr: self._convert_value(row[attr]) 
-                            for attr in self.attributes}
+                    'name': str(row[identifier_col]),  # Convert to string to handle any type
+                    'stats': {attr: float(row[attr]) 
+                             for attr in self.attributes}
                 }
                 self.cards.append(card)
                 
@@ -101,12 +114,13 @@ class TopTrumpsDeck:
 
     def _convert_value(self, value) -> float:
         """Convert string values to numeric, handling special cases"""
-        if pd.isna(value):
+        if pd.isna(value) or value == 'n/a':
             return 0.0
         if isinstance(value, str):
-            if value.lower() == "yes":
+            value = value.lower().strip()
+            if value == "yes":
                 return 100.0
-            elif value.lower() == "no":
+            elif value == "no":
                 return 0.0
             try:
                 return float(value.replace(',', ''))
@@ -216,8 +230,10 @@ class HumanPlayer(Player):
         print(f"Your card: {card['name']}")
         print("-"*50)
         print("Attributes:")
-        for i, (attr, value) in enumerate(card['stats'].items(), 1):
-            print(f"{i}. {attr}: {value:.1f}")
+        
+        # Always use display_stats for showing values
+        for i, (attr, value) in enumerate(card['display_stats'].items(), 1):
+            print(f"{i}. {attr}: {value}")
         print("="*50)
         
         while True:
@@ -247,7 +263,6 @@ class TopTrumpsGame:
         cards = self.deck.cards.copy()
         random.shuffle(cards)
         
-        # Verify shuffle quality
         if len(cards) >= 10:
             original_order = [c['name'] for c in self.deck.cards]
             new_order = [c['name'] for c in cards]
@@ -263,13 +278,17 @@ class TopTrumpsGame:
         self.player2.hand = cards[mid:]
 
     def _display_round(self, p1_card: dict, p2_card: dict, selected_attr: str):
-        """Display round information"""
+        """Display round information using original values"""
         print("\n" + "="*60)
         print(f"Round {self.round_number}".center(60))
         print("-"*60)
         print(f"{self.player1.name}'s card: {p1_card['name']:<30} {self.player2.name}'s card: {p2_card['name']}")
         print(f"Selected attribute: {selected_attr}")
-        print(f"Values: {self.player1.name}: {p1_card['stats'][selected_attr]:.1f} vs {self.player2.name}: {p2_card['stats'][selected_attr]:.1f}")
+        
+        # Always use display_stats for showing values
+        p1_val = p1_card['display_stats'][selected_attr]
+        p2_val = p2_card['display_stats'][selected_attr]
+        print(f"Values: {self.player1.name}: {p1_val} vs {self.player2.name}: {p2_val}")
         print("-"*60)
 
     def play_round(self, current_player: Player, opponent: Player) -> Tuple[Optional[Player], dict]:
@@ -288,6 +307,7 @@ class TopTrumpsGame:
         
         self._display_round(p1_card, p2_card, selected_attr)
         
+        # Use normalized values for comparison
         p1_val = p1_card['stats'][selected_attr]
         p2_val = p2_card['stats'][selected_attr]
         
@@ -307,7 +327,6 @@ class TopTrumpsGame:
             self.player1.update_stats(False)
             self.player2.update_stats(True)
             
-        # Update AI players' history
         if isinstance(current_player, AIPlayer):
             current_player.update_history(selected_attr, winner == current_player)
         
@@ -321,12 +340,10 @@ class TopTrumpsGame:
         }
         self.game_history.append(round_data)
         
-        # Only pause during demo mode (when both players are AI)
         if isinstance(self.player1, AIPlayer) and isinstance(self.player2, AIPlayer) and self.mode == 'demo':
             input("\nPress Enter to continue...")
         
         return winner, round_data
-
     async def play_game(self) -> Tuple[Optional[Player], List[dict]]:
         """Play full game"""
         self._deal_cards()
@@ -334,9 +351,9 @@ class TopTrumpsGame:
         rounds_played = 0
         max_rounds = min(100, len(self.deck.cards) * 2)
         
-        print("\nGame Started!")
-        print(f"{self.player1.name} vs {self.player2.name}")
-        print(f"Initial cards: {len(self.player1.hand)} each")
+        #print("\nGame Started!")
+        #print(f"{self.player1.name} vs {self.player2.name}")
+        #print(f"Initial cards: {len(self.player1.hand)} each")
         
         while self.player1.hand and self.player2.hand and rounds_played < max_rounds:
             opponent = self.player2 if current_player == self.player1 else self.player1
@@ -380,33 +397,34 @@ class TopTrumpsGame:
             p2_total = sum(sum(card['stats'].values()) for card in self.player2.hand)
             game_winner = self.player1 if p1_total >= p2_total else self.player2
             
-        print("\nGame Over!")
-        print(f"Winner: {game_winner.name}")
-        print(f"Final Score - {self.player1.name}: {len(self.player1.hand)} cards, {self.player2.name}: {len(self.player2.hand)} cards")
+        #print("\nGame Over!")
+        #print(f"Winner: {game_winner.name}")
+        #print(f"Final Score - {self.player1.name}: {len(self.player1.hand)} cards, {self.player2.name}: {len(self.player2.hand)} cards")
         
         return game_winner, self.game_history
 
 def create_hmm(deck: TopTrumpsDeck) -> HiddenMarkovModel:
-    """Create HMM where states represent the best attribute to choose"""
+    """Create HMM with improved state transitions based on normalized values"""
     states = []
     n_attributes = len(deck.attributes)
     
-    # Create a state for each attribute
+    # Create states with emission probabilities
     for i, attr in enumerate(deck.attributes):
-        # Initialize distribution based on attribute statistics
         stats = deck.attribute_stats[attr]
         
-        # Calculate initial emission probabilities based on value distribution
-        # Higher variance means attribute is more discriminative
-        variance_weight = stats['variance'] / (stats['mean'] ** 2) if stats['mean'] > 0 else 0
+        # Calculate state importance based on normalized statistics
+        importance = stats['range'] / (stats['std'] + 1e-6)
         
-        # Create emission distribution favoring this attribute
+        # Create emission distribution
         dist = {}
+        base_prob = min(0.6, max(0.4, importance / (n_attributes)))
+        remaining_prob = (1.0 - base_prob) / (n_attributes - 1)
+        
         for j in range(n_attributes):
             if j == i:
-                dist[j] = 0.5  # 50% chance of emitting its own attribute
+                dist[j] = base_prob
             else:
-                dist[j] = 0.5 / (n_attributes - 1)  # Evenly split remaining probability
+                dist[j] = remaining_prob
                 
         distribution = DiscreteDistribution(dist)
         states.append(State(distribution, name=attr))
@@ -415,144 +433,208 @@ def create_hmm(deck: TopTrumpsDeck) -> HiddenMarkovModel:
     model = HiddenMarkovModel()
     model.add_states(states)
     
-    # Initialize transitions based on attribute correlations
+    # Initialize transitions
     for i, state1 in enumerate(states):
         attr1 = deck.attributes[i]
+        stats1 = deck.attribute_stats[attr1]
         
-        # Calculate transition probabilities based on attribute relationships
+        transition_weights = []
         total_weight = 0
-        weights = []
         
         for j, state2 in enumerate(states):
             attr2 = deck.attributes[j]
+            stats2 = deck.attribute_stats[attr2]
+            
             if i == j:
-                # Favor staying in same state if attribute has been successful
+                # Self-transition probability
                 weight = 0.4
             else:
-                # Base transition probability on relative attribute strengths
-                stat1 = deck.attribute_stats[attr1]
-                stat2 = deck.attribute_stats[attr2]
-                
-                # Compare distributions
-                mean_diff = abs(stat1['mean'] - stat2['mean'])
-                var_ratio = max(stat1['variance'], stat2['variance']) / (min(stat1['variance'], stat2['variance']) + 1e-6)
-                
-                weight = 1.0 / (1.0 + mean_diff * var_ratio)
+                # Calculate transition weight based on attribute relationships
+                mean_diff = abs(stats1['norm_mean'] - stats2['norm_mean']) / 100.0
+                weight = 1.0 / (1.0 + mean_diff)
             
-            weights.append(weight)
+            transition_weights.append(weight)
             total_weight += weight
         
-        # Normalize weights to probabilities
-        for j, weight in enumerate(weights):
+        # Normalize transitions
+        for j, weight in enumerate(transition_weights):
             prob = weight / total_weight
             model.add_transition(state1, states[j], prob)
-            
-        # Add start probabilities - favor attributes with higher mean values initially
-        start_weight = deck.attribute_stats[attr1]['mean'] / 100.0
-        model.add_transition(model.start, state1, start_weight)
+        
+        # Start probabilities
+        start_prob = stats1['norm_mean'] / sum(s.attribute_stats[a]['norm_mean'] 
+                                              for a, s in zip(deck.attributes, [deck]*len(deck.attributes)))
+        model.add_transition(model.start, state1, start_prob)
     
     model.bake()
     return model
 
+class SilentTopTrumpsGame(TopTrumpsGame):
+    """Completely silent version of the game for training"""
+    def _display_round(self, *args, **kwargs):
+        pass
+
+    def play_round(self, current_player: Player, opponent: Player) -> Tuple[Optional[Player], dict]:
+        """Silent version of play_round without any output"""
+        self.round_number += 1
+        
+        if not self.player1.hand or not self.player2.hand:
+            return None, {}
+
+        p1_card = self.player1.hand[0]
+        p2_card = self.player2.hand[0]
+        
+        selected_attr = current_player.choose_attribute(
+            p1_card if current_player == self.player1 else p2_card
+        )
+        
+        p1_val = p1_card['stats'][selected_attr]
+        p2_val = p2_card['stats'][selected_attr]
+        
+        if abs(p1_val - p2_val) < 1e-10:
+            winner = None
+            self.player1.update_stats(False, draw=True)
+            self.player2.update_stats(False, draw=True)
+        elif p1_val > p2_val:
+            winner = self.player1
+            self.player1.update_stats(True)
+            self.player2.update_stats(False)
+        else:
+            winner = self.player2
+            self.player1.update_stats(False)
+            self.player2.update_stats(True)
+            
+        if isinstance(current_player, AIPlayer):
+            current_player.update_history(selected_attr, winner == current_player)
+        
+        round_data = {
+            'round': self.round_number,
+            'current_player': current_player.name,
+            'p1_card': p1_card,
+            'p2_card': p2_card,
+            'selected_attr': selected_attr,
+            'winner': winner.name if winner else 'draw'
+        }
+        self.game_history.append(round_data)
+        
+        return winner, round_data
+
+async def print_training_report(model: HiddenMarkovModel, deck: TopTrumpsDeck, win_rate: float):
+    """Print comprehensive training report for a deck"""
+    print("\nTraining Report")
+    print("=" * 50)
+    
+    # Model Overview
+    print(f"\nModel Performance:")
+    print(f"Win Rate: {win_rate:.1f}%")
+    print(f"Total Attributes: {len(deck.attributes)}")
+    
+    # Attribute Analysis
+    print("\nAttribute Analysis:")
+    print("-" * 30)
+    
+    for state in model.states:
+        if not hasattr(state, 'name') or state.name not in deck.attributes:
+            continue
+            
+        attr_idx = deck.attributes.index(state.name)
+        stats = deck.attribute_stats[state.name]
+        
+        print(f"\n{state.name}")
+        print(f"  Value Range: {stats['min']:.1f} - {stats['max']:.1f}")
+        print(f"  Mean: {stats['mean']:.1f}")
+        print(f"  Standard Deviation: {stats['std']:.1f}")
+        
+        # Transition probabilities
+        transitions = []
+        for next_state in model.states:
+            if hasattr(next_state, 'name') and next_state.name in deck.attributes:
+                next_idx = deck.attributes.index(next_state.name)
+                prob = model.dense_transition_matrix()[attr_idx][next_idx]
+                transitions.append((next_state.name, prob))
+        
+        transitions.sort(key=lambda x: x[1], reverse=True)
+        print("  Strategy Analysis:")
+        for attr, prob in transitions[:3]:
+            print(f"    After using {state.name}, {prob*100:.1f}% chance to use {attr}")
+
 async def train_model(decks: List[str], n_games: int = 1000, epochs: int = 5) -> Dict[str, HiddenMarkovModel]:
-    """Train HMM models for each deck type"""
+    """Train HMM models with minimal output"""
     deck_models = {}
     
-    print("\nAnalyzing deck characteristics...")
-    # First pass: analyze all decks to understand attribute distributions
+    print("\nAnalyzing decks...")
     for deck_path in decks:
-        deck_name = Path(deck_path).stem
-        print(f"\nAnalyzing {deck_name}")
-        
         try:
             deck = TopTrumpsDeck(deck_path)
-            # Create initial model based on deck statistics
-            model = create_hmm(deck)
-            deck_models[deck_name] = model
+            if not deck.attributes:
+                logger.warning(f"No valid numeric attributes found in {deck_path}")
+                continue
             
-            # Output initial attribute analysis
-            print("\nAttribute Statistics:")
-            for attr in deck.attributes:
-                stats = deck.attribute_stats[attr]
-                print(f"\n{attr}:")
-                print(f"  Mean: {stats['mean']:.2f}")
-                print(f"  Std Dev: {stats['std']:.2f}")
-                print(f"  Range: {stats['range']:.2f}")
-                print(f"  Variance: {stats['variance']:.2f}")
-                
+            model = create_hmm(deck)
+            deck_models[deck_path] = model
+            print(f"✓ {Path(deck_path).stem}: {len(deck.attributes)} attributes")
+            
         except Exception as e:
             logger.error(f"Error analyzing deck {deck_path}: {e}")
             continue
     
-    print("\nStarting Training Phase")
+    print("\nStarting Training")
     print("=" * 50)
     
     for epoch in range(epochs):
         print(f"\nEpoch {epoch + 1}/{epochs}")
-        print("-" * 30)
-        
-        # Track stats for each deck separately
-        deck_stats = {}
         
         for deck_path in decks:
-            deck_name = Path(deck_path).stem
+            if deck_path not in deck_models:
+                continue
+                
             try:
                 deck = TopTrumpsDeck(deck_path)
-                model = deck_models[deck_name]
+                model = deck_models[deck_path]
+                deck_name = Path(deck_path).stem
                 
-                print(f"\nTraining on deck: {deck_name}")
-                progress_interval = max(1, n_games // len(decks) // 10)
+                wins = 0
+                total_games = 0
                 
-                for game_num in range(n_games // len(decks)):
-                    p1 = AIPlayer("Player1", {deck_name: model})
-                    p2 = AIPlayer("Player2", None)  # Second player uses simple strategy
+                print(f"\n{deck_name}: ", end='', flush=True)
+                progress_step = max(1, n_games // 50)  # For 50-character progress bar
+                
+                for game_num in range(n_games):
+                    p1 = AIPlayer("Player1", {deck_path: model})
+                    p2 = AIPlayer("Player2", None)
                     
-                    # Set current deck for p1
                     p1.set_deck(deck)
                     
-                    game = TopTrumpsGame(deck, p1, p2, mode='train')
+                    game = SilentTopTrumpsGame(deck, p1, p2, mode='train')
                     winner, history = await game.play_game()
                     
-                    if deck_name not in deck_stats:
-                        deck_stats[deck_name] = {'wins': 0, 'total': 0}
-                    
-                    deck_stats[deck_name]['total'] += 1
+                    total_games += 1
                     if winner == p1:
-                        deck_stats[deck_name]['wins'] += 1
+                        wins += 1
                     
-                    # Update model with game history
+                    # Update model
                     if history:
                         sequence = []
                         for round_data in history:
-                            attr_idx = deck.attributes.index(round_data['selected_attr'])
-                            sequence.append(attr_idx)
+                            if round_data['selected_attr'] in deck.attributes:
+                                attr_idx = deck.attributes.index(round_data['selected_attr'])
+                                sequence.append(attr_idx)
                         
                         if len(sequence) > 1:
-                            model.fit([sequence], algorithm='baum-welch', min_iterations=1, max_iterations=5)
+                            model.fit([sequence], algorithm='baum-welch', 
+                                    min_iterations=1, max_iterations=5)
                     
-                    if game_num % progress_interval == 0:
-                        win_rate = deck_stats[deck_name]['wins'] / deck_stats[deck_name]['total'] * 100
-                        print(f"\rProgress: {game_num/(n_games//len(decks))*100:.1f}% | Win Rate: {win_rate:.1f}%", end="")
+                    # Update progress bar
+                    if game_num % progress_step == 0:
+                        print('■', end='', flush=True)
                 
-                print("\n")  # New line after progress
+                print()  # New line after progress bar
                 
-                # Output final model parameters
-                print("\nState Analysis:")
-                for state in model.states:
-                    if hasattr(state, 'name') and state.name in deck.attributes:
-                        print(f"\nState: {state.name}")
-                        attr_idx = deck.attributes.index(state.name)
-                        # Show top transition probabilities
-                        transitions = []
-                        for next_state in model.states:
-                            if hasattr(next_state, 'name') and next_state.name in deck.attributes:
-                                prob = model.dense_transition_matrix()[attr_idx][deck.attributes.index(next_state.name)]
-                                transitions.append((next_state.name, prob))
-                        transitions.sort(key=lambda x: x[1], reverse=True)
-                        print("Top transitions:")
-                        for attr, prob in transitions[:3]:
-                            print(f"  -> {attr}: {prob:.3f}")
-                
+                # Print final report after last epoch
+                if epoch == epochs - 1:
+                    win_rate = (wins / total_games) * 100 if total_games > 0 else 0
+                    await print_training_report(model, deck, win_rate)
+                    
             except Exception as e:
                 logger.error(f"Error training on deck {deck_path}: {e}")
                 continue
