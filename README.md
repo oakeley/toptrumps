@@ -27,13 +27,13 @@ conda create -n trump
 
 conda activate trump
 
-conda install tenacity -y
+conda install pomegranate  -y
 
-conda install numpy  -y
+conda install tenacity -y
 
 conda install pandas -y
 
-conda install hmmlearn -y
+#conda install hmmlearn -y
 
 conda install httpx  -y
 
