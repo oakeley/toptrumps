@@ -27,4 +27,16 @@ conda create -n trump
 
 conda activate trump
 
-conda install numpy pandas hmmlearn random json pickle httpx argparse typing tenacity pathlib
+conda install tenacity -y
+
+conda install numpy  -y
+
+conda install pandas -y
+
+conda install hmmlearn -y
+
+conda install httpx  -y
+
+conda install typing -y
+
+pip install argparse
