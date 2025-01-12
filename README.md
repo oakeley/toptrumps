@@ -1,5 +1,5 @@
 # toptrumps
-HMM model for learning how to play top trumps with Ollama Phi4 for language comprehension
+HMM model for learning how to play top trumps
 ## Train and save the best model
 python toptrump.py train
 ## Load the best model and play the game on the screen with the text prompts and cards from each play displayed live so we can watch the game
