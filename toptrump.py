@@ -126,6 +126,29 @@ class Player:
     async def choose_attribute(self, card: dict) -> str:
         raise NotImplementedError
 
+class TrainingPlayer(Player):
+    """Fast player for training - uses simple heuristic"""
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.attribute_stats = {}  # Track success rate of attributes
+
+    async def choose_attribute(self, card: dict) -> str:
+        if not self.attribute_stats:
+            # Initialize stats for each attribute
+            for attr in card['stats'].keys():
+                self.attribute_stats[attr] = {'wins': 1, 'total': 2}  # Laplace smoothing
+        
+        # Choose attribute with best win rate
+        best_attr = max(self.attribute_stats.items(), 
+                       key=lambda x: x[1]['wins'] / x[1]['total'])
+        return best_attr[0]
+
+    def update_stats(self, attribute: str, won: bool):
+        if attribute in self.attribute_stats:
+            self.attribute_stats[attribute]['total'] += 1
+            if won:
+                self.attribute_stats[attribute]['wins'] += 1
+
 class LLMPlayer(Player):
     """AI player using Ollama LLM"""
     def __init__(self, name: str, ollama_client: OllamaLLM):
@@ -259,10 +282,10 @@ class TopTrumpsGame:
         return np.array([attr_idx, outcome])
 
 async def train_model(training_decks: List[str], n_games: int = 1000, epochs: int = 5) -> hmm.MultinomialHMM:
-    """Train HMM model using multiple games"""
-    ollama = OllamaLLM()
+    """Train HMM model using multiple games with fast training players"""
     best_model = None
     best_win_rate = 0
+    n_states = 5  # Increased number of states for better modeling
     
     print("\nStarting Training:")
     print("=" * 50)
@@ -271,7 +294,15 @@ async def train_model(training_decks: List[str], n_games: int = 1000, epochs: in
         print(f"\nEpoch {epoch + 1}/{epochs}")
         print("-" * 50)
         
-        model = hmm.MultinomialHMM(n_components=3, n_iter=100)
+        # Initialize new model with proper multinomial emission
+        n_attributes = len(TopTrumpsDeck(training_decks[0]).attributes)
+        model = hmm.MultinomialHMM(
+            n_components=n_states,
+            n_iter=100,
+            implementation="scaling",
+            random_state=epoch
+        )
+        
         all_observations = []
         stats = TrainingStats()
         
@@ -281,14 +312,25 @@ async def train_model(training_decks: List[str], n_games: int = 1000, epochs: in
         for deck_idx, deck_path in enumerate(training_decks):
             deck = TopTrumpsDeck(deck_path)
             deck_name = Path(deck_path).stem
-            p1 = LLMPlayer("Player1", ollama)
-            p2 = LLMPlayer("Player2", ollama)
+            p1 = TrainingPlayer("Player1")  # Use fast training player
+            p2 = TrainingPlayer("Player2")
             
             print(f"\nTraining on deck: {deck_name}")
             
             for game_num in range(games_per_deck):
                 game = TopTrumpsGame(deck, p1, p2)
                 winner, history = await game.play_game()
+                
+                # Update player stats for better attribute selection
+                for round_data in history:
+                    attr = round_data['selected_attr']
+                    if round_data['winner'] == 'Player1':
+                        p1.update_stats(attr, True)
+                        p2.update_stats(attr, False)
+                    elif round_data['winner'] == 'Player2':
+                        p1.update_stats(attr, False)
+                        p2.update_stats(attr, True)
+                
                 stats.update(history, winner.name)
                 
                 observations = np.array([game._round_to_observation(round_data) 
@@ -300,17 +342,26 @@ async def train_model(training_decks: List[str], n_games: int = 1000, epochs: in
                     progress = ((deck_idx * games_per_deck + game_num + 1) / total_games) * 100
                     print(f"\rProgress: {progress:.1f}% | {stats}", end="")
         
-        # Fit model
-        lengths = [len(obs) for obs in all_observations]
-        model.fit(np.concatenate(all_observations), lengths)
-        
-        # Evaluate model
-        if stats.win_rate > best_win_rate:
-            best_win_rate = stats.win_rate
-            best_model = model
-            print(f"\n\nNew best model found! Win Rate: {best_win_rate:.1f}%")
-        else:
-            print(f"\n\nNo improvement. Current best win rate: {best_win_rate:.1f}%")
+        # Fit model with concatenated observations
+        if all_observations:
+            obs_matrix = np.concatenate(all_observations)
+            lengths = [len(obs) for obs in all_observations]
+            try:
+                model.fit(obs_matrix, lengths)
+                
+                # Evaluate model
+                if stats.win_rate > best_win_rate:
+                    best_win_rate = stats.win_rate
+                    best_model = model
+                    print(f"\n\nNew best model found! Win Rate: {best_win_rate:.1f}%")
+                else:
+                    print(f"\n\nNo improvement. Current best win rate: {best_win_rate:.1f}%")
+            except Exception as e:
+                print(f"\nWarning: Model fitting failed: {e}")
+                continue
+    
+    if best_model is None:
+        raise RuntimeError("Failed to train any successful models")
     
     print("\nTraining Complete!")
     print(f"Final Best Model Win Rate: {best_win_rate:.1f}%")
