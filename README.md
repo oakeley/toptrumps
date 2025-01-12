@@ -15,13 +15,6 @@ ls Top-Trumps-data/ | grep Top > start; ls Top-Trumps-data/ | grep Top | sed 's/
 
 bash ren.sh
 
-## Install Ollama Phi4
-### Download and install the latestest version of ollama from Meta
-curl -fsSL https://ollama.com/install.sh | sh
-### This will download and start the phi4 model. This is a good test
-ollama run phi4
-### Exit ollama once you have verified that it runs on your system
-CTRL-D
 ## Create conda environment
 conda create -n trump
 
