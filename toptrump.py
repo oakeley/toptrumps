@@ -1,25 +1,24 @@
 import numpy as np
 import pandas as pd
-from hmmlearn import hmm
+from pomegranate import HiddenMarkovModel, State, DiscreteDistribution
 import random
-import json
 import pickle
 import asyncio
-import httpx
 import logging
 import argparse
 from typing import List, Dict, Tuple, Optional
-from tenacity import retry, stop_after_attempt, wait_exponential
 from pathlib import Path
+from copy import deepcopy
 
 # Set up logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
-# Disable httpx logging
-logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# Progress tracking
 class TrainingStats:
+    """Track training progress and performance"""
     def __init__(self):
         self.total_games = 0
         self.wins_p1 = 0
@@ -39,43 +38,6 @@ class TrainingStats:
                 f"Avg Rounds/Game: {self.avg_rounds_per_game:.1f} | "
                 f"Total Games: {self.total_games}")
 
-class OllamaLLM:
-    """Handles interactions with the Ollama phi4 model"""
-    def __init__(self, model_name="phi4"):
-        self.model_name = model_name
-        self.api_url = "http://localhost:11434/api/generate"
-        
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10)
-    )
-    async def generate(self, prompt: str) -> str:
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    self.api_url,
-                    json={
-                        "model": self.model_name,
-                        "prompt": prompt,
-                        "stream": False,
-                        "temperature": 0.7,
-                        "top_p": 0.9
-                    }
-                )
-                
-                if response.status_code != 200:
-                    raise RuntimeError(f"Ollama API returned status {response.status_code}")
-                    
-                result = response.json()["response"].strip()
-                if not result:
-                    raise ValueError("Empty response from LLM")
-                    
-                return result
-                
-        except Exception as e:
-            logger.error(f"Error generating response from Ollama: {e}")
-            raise
-
 class TopTrumpsDeck:
     """Handles deck loading and preprocessing"""
     def __init__(self, csv_path: str):
@@ -87,7 +49,39 @@ class TopTrumpsDeck:
     def _load_deck(self):
         try:
             df = pd.read_csv(self.csv_path)
-            self.attributes = [col for col in df.columns if col != 'Individual']
+            if 'Individual' not in df.columns and 'Name' in df.columns:
+                df = df.rename(columns={'Name': 'Individual'})
+            
+            if 'Individual' not in df.columns:
+                raise ValueError("Deck must have 'Individual' or 'Name' column")
+            
+            # First pass: identify numeric columns
+            valid_attributes = []
+            for col in df.columns:
+                if col == 'Individual':
+                    continue
+                    
+                # Replace 'n/a' with np.nan
+                df[col] = df[col].replace('n/a', np.nan)
+                
+                # Try to convert to numeric
+                numeric_series = pd.to_numeric(df[col], errors='coerce')
+                
+                # Check if column is mostly numeric
+                if numeric_series.notna().sum() > len(df) * 0.5:
+                    valid_attributes.append(col)
+                    min_val = numeric_series[numeric_series.notna()].min()
+                    df.loc[numeric_series.isna(), col] = min_val
+            
+            self.attributes = valid_attributes
+            
+            # Standardize numeric values to 0-100 range
+            for attr in self.attributes:
+                numeric_vals = pd.to_numeric(df[attr], errors='coerce')
+                min_val = numeric_vals.min()
+                max_val = numeric_vals.max()
+                if max_val != min_val:
+                    df[attr] = ((numeric_vals - min_val) / (max_val - min_val)) * 100
             
             # Convert deck to list of dictionaries
             for _, row in df.iterrows():
@@ -108,7 +102,7 @@ class TopTrumpsDeck:
             return 0.0
         if isinstance(value, str):
             if value.lower() == "yes":
-                return 1.0
+                return 100.0
             elif value.lower() == "no":
                 return 0.0
             try:
@@ -125,73 +119,65 @@ class Player:
     def __init__(self, name: str):
         self.name = name
         self.hand: List[dict] = []
-
-    async def choose_attribute(self, card: dict) -> str:
+        self.stats = {'wins': 0, 'losses': 0, 'draws': 0}
+    
+    def choose_attribute(self, card: dict) -> str:
         raise NotImplementedError
-
-class TrainingPlayer(Player):
-    """Fast player for training - uses simple heuristic"""
-    def __init__(self, name: str):
-        super().__init__(name)
-        self.attribute_stats = {}  # Track success rate of attributes
-        self.debug = True  # Enable debug output
-
-    async def choose_attribute(self, card: dict) -> str:
-        if not self.attribute_stats:
-            # Initialize stats for each attribute
-            for attr in card['stats'].keys():
-                self.attribute_stats[attr] = {'wins': 1, 'total': 2}  # Laplace smoothing
         
-        # Choose attribute with best value in current card
-        best_attr = max(card['stats'].items(), key=lambda x: x[1])
-        if self.debug:
-            print(f"{self.name} choosing {best_attr[0]} with value {best_attr[1]}")
-        return best_attr[0]
+    def update_stats(self, won: bool, draw: bool = False):
+        if draw:
+            self.stats['draws'] += 1
+        elif won:
+            self.stats['wins'] += 1
+        else:
+            self.stats['losses'] += 1
 
-    def update_stats(self, attribute: str, won: bool):
-        if attribute in self.attribute_stats:
-            self.attribute_stats[attribute]['total'] += 1
-            if won:
-                self.attribute_stats[attribute]['wins'] += 1
-
-class LLMPlayer(Player):
-    """AI player using Ollama LLM"""
-    def __init__(self, name: str, ollama_client: OllamaLLM):
+class AIPlayer(Player):
+    """AI player using HMM for decisions"""
+    def __init__(self, name: str, hmm_model: Optional[HiddenMarkovModel] = None):
         super().__init__(name)
-        self.ollama_client = ollama_client
+        self.hmm_model = hmm_model
+        self.attribute_stats = {}
 
-    async def choose_attribute(self, card: dict) -> str:
-        prompt = self._generate_attribute_prompt(card)
-        response = await self.ollama_client.generate(prompt)
-        return self._parse_attribute_response(response, list(card['stats'].keys()))
+    def choose_attribute(self, card: dict) -> str:
+        if self.hmm_model is None or not self.attribute_stats:
+            return max(card['stats'].items(), key=lambda x: x[1])[0]
+            
+        # Weight attributes by success rate and current values
+        weighted_scores = {}
+        for attr, value in card['stats'].items():
+            stats = self.attribute_stats.get(attr, {'win_rate': 0.5})
+            weighted_scores[attr] = value * (0.5 + stats['win_rate'])
+            
+        return max(weighted_scores.items(), key=lambda x: x[1])[0]
 
-    def _generate_attribute_prompt(self, card: dict) -> str:
-        return f"""You are playing Top Trumps. Here is your card:
-Name: {card['name']}
-Attributes: {json.dumps(card['stats'], indent=2)}
-
-Choose the attribute you think is most likely to win. Reply with just the attribute name."""
-
-    def _parse_attribute_response(self, response: str, valid_attributes: List[str]) -> str:
-        # Clean up response and match to valid attributes
-        response = response.strip().lower()
-        for attr in valid_attributes:
-            if attr.lower() in response:
-                return attr
-        # Default to first attribute if no match found
-        return valid_attributes[0]
+    def update_attribute_stats(self, attribute: str, won: bool):
+        if attribute not in self.attribute_stats:
+            self.attribute_stats[attribute] = {'wins': 0, 'total': 0, 'win_rate': 0.5}
+        
+        stats = self.attribute_stats[attribute]
+        stats['total'] += 1
+        if won:
+            stats['wins'] += 1
+        stats['win_rate'] = stats['wins'] / stats['total']
 
 class HumanPlayer(Player):
     """Human player interface"""
-    async def choose_attribute(self, card: dict) -> str:
-        print(f"\nYour card: {card['name']}")
+    def choose_attribute(self, card: dict) -> str:
+        print("\n" + "="*50)
+        print(f"Your card: {card['name']}")
+        print("-"*50)
         print("Attributes:")
         for i, (attr, value) in enumerate(card['stats'].items(), 1):
-            print(f"{i}. {attr}: {value}")
+            print(f"{i}. {attr}: {value:.1f}")
+        print("="*50)
         
         while True:
             try:
-                choice = int(input("\nChoose attribute number: ")) - 1
+                choice = input("\nChoose attribute number (or 'q' to quit): ")
+                if choice.lower() == 'q':
+                    raise KeyboardInterrupt
+                choice = int(choice) - 1
                 if 0 <= choice < len(card['stats']):
                     return list(card['stats'].keys())[choice]
             except ValueError:
@@ -200,62 +186,84 @@ class HumanPlayer(Player):
 
 class TopTrumpsGame:
     """Main game logic"""
-    def __init__(self, deck: TopTrumpsDeck, player1: Player, player2: Player, hmm_model: Optional[hmm.MultinomialHMM] = None):
+    def __init__(self, deck: TopTrumpsDeck, player1: Player, player2: Player):
         self.deck = deck
         self.player1 = player1
         self.player2 = player2
-        self.hmm_model = hmm_model
         self.game_history = []
-        self.debug = True  # Enable debug output
+        self.round_number = 0
 
     def _deal_cards(self):
-        cards = self.deck.cards.copy()  # Make a copy to avoid modifying original
+        """Deal cards with shuffle verification"""
+        cards = self.deck.cards.copy()
         random.shuffle(cards)
+        
+        # Verify shuffle quality
+        if len(cards) >= 10:
+            original_order = [c['name'] for c in self.deck.cards]
+            new_order = [c['name'] for c in cards]
+            common_sequence = 0
+            for i in range(len(cards)-1):
+                if original_order.index(new_order[i]) + 1 == original_order.index(new_order[i+1]):
+                    common_sequence += 1
+            if common_sequence > len(cards) // 4:
+                random.shuffle(cards)
+        
         mid = len(cards) // 2
         self.player1.hand = cards[:mid]
         self.player2.hand = cards[mid:]
-        if self.debug:
-            print(f"Dealt {len(self.player1.hand)} cards to each player")
 
-    async def play_round(self, current_player: Player, opponent: Player) -> Tuple[Optional[Player], dict]:
+    def _display_round(self, p1_card: dict, p2_card: dict, selected_attr: str):
+        """Display round information"""
+        print("\n" + "="*60)
+        print(f"Round {self.round_number}".center(60))
+        print("-"*60)
+        print(f"{self.player1.name}'s card: {p1_card['name']:<30} {self.player2.name}'s card: {p2_card['name']}")
+        print(f"Selected attribute: {selected_attr}")
+        print(f"Values: {self.player1.name}: {p1_card['stats'][selected_attr]:.1f} vs {self.player2.name}: {p2_card['stats'][selected_attr]:.1f}")
+        print("-"*60)
+
+    def play_round(self, current_player: Player, opponent: Player) -> Tuple[Optional[Player], dict]:
+        """Play a single round"""
+        self.round_number += 1
+        
         if not self.player1.hand or not self.player2.hand:
-            if self.debug:
-                print("Warning: One player has no cards!")
             return None, {}
 
         p1_card = self.player1.hand[0]
         p2_card = self.player2.hand[0]
         
-        # Get attribute choice
-        selected_attr = await current_player.choose_attribute(
+        selected_attr = current_player.choose_attribute(
             p1_card if current_player == self.player1 else p2_card
         )
         
-        if self.debug:
-            print(f"\nRound detail:")
-            print(f"Player 1 card: {p1_card['name']}, {selected_attr}: {p1_card['stats'][selected_attr]}")
-            print(f"Player 2 card: {p2_card['name']}, {selected_attr}: {p2_card['stats'][selected_attr]}")
+        self._display_round(p1_card, p2_card, selected_attr)
         
-        # Compare values
         p1_val = p1_card['stats'][selected_attr]
         p2_val = p2_card['stats'][selected_attr]
         
-        # Determine winner
-        if p1_val > p2_val:
-            winner = self.player1
-            if self.debug:
-                print("Player 1 wins round")
-        elif p2_val > p1_val:
-            winner = self.player2
-            if self.debug:
-                print("Player 2 wins round")
-        else:
+        if abs(p1_val - p2_val) < 1e-10:
             winner = None
-            if self.debug:
-                print("Round is a draw")
-            
-        # Record round
+            print("Round Draw!")
+            self.player1.update_stats(False, draw=True)
+            self.player2.update_stats(False, draw=True)
+        elif p1_val > p2_val:
+            winner = self.player1
+            print(f"{self.player1.name} wins the round!")
+            self.player1.update_stats(True)
+            self.player2.update_stats(False)
+        else:
+            winner = self.player2
+            print(f"{self.player2.name} wins the round!")
+            self.player1.update_stats(False)
+            self.player2.update_stats(True)
+        
+        if isinstance(current_player, AIPlayer):
+            current_player.update_attribute_stats(selected_attr, winner == current_player)
+        
         round_data = {
+            'round': self.round_number,
+            'current_player': current_player.name,
             'p1_card': p1_card,
             'p2_card': p2_card,
             'selected_attr': selected_attr,
@@ -263,145 +271,197 @@ class TopTrumpsGame:
         }
         self.game_history.append(round_data)
         
+        # In demo mode (AI vs AI), pause after each round
+        if isinstance(self.player1, AIPlayer) and isinstance(self.player2, AIPlayer):
+            input("\nPress Enter to continue...")
+        
         return winner, round_data
 
     async def play_game(self) -> Tuple[Optional[Player], List[dict]]:
+        """Play full game"""
         self._deal_cards()
         current_player = self.player1
         rounds_played = 0
-        max_rounds = 100  # Prevent infinite games
+        max_rounds = min(100, len(self.deck.cards) * 2)
+        
+        print("\nGame Started!")
+        print(f"{self.player1.name} vs {self.player2.name}")
+        print(f"Initial cards: {len(self.player1.hand)} each")
         
         while self.player1.hand and self.player2.hand and rounds_played < max_rounds:
-            winner, round_data = await self.play_round(
-                current_player,
-                self.player2 if current_player == self.player1 else self.player1
-            )
+            opponent = self.player2 if current_player == self.player1 else self.player1
             
-            # Move cards
             try:
-                p1_card = self.player1.hand.pop(0)
-                p2_card = self.player2.hand.pop(0)
-            
-                if winner == self.player1:
-                    self.player1.hand.extend([p1_card, p2_card])
-                    current_player = self.player1
-                elif winner == self.player2:
-                    self.player2.hand.extend([p1_card, p2_card])
-                    current_player = self.player2
-                else:
-                    # On draw, split the cards
-                    self.player1.hand.append(p1_card)
-                    self.player2.hand.append(p2_card)
-            except IndexError:
+                winner, _ = self.play_round(current_player, opponent)
+                
+                if len(self.player1.hand) > 0 and len(self.player2.hand) > 0:
+                    p1_card = self.player1.hand.pop(0)
+                    p2_card = self.player2.hand.pop(0)
+                
+                    if winner == self.player1:
+                        self.player1.hand.extend([p1_card, p2_card])
+                        current_player = self.player1
+                    elif winner == self.player2:
+                        self.player2.hand.extend([p1_card, p2_card])
+                        current_player = self.player2
+                    else:
+                        self.player1.hand.append(p1_card)
+                        self.player2.hand.append(p2_card)
+                        current_player = opponent
+                
+            except KeyboardInterrupt:
+                print("\nGame terminated by user")
+                break
+            except Exception as e:
+                logger.error(f"Error during round: {e}")
                 break
             
             rounds_played += 1
+            print(f"Cards remaining - {self.player1.name}: {len(self.player1.hand)}, {self.player2.name}: {len(self.player2.hand)}")
         
-        # Determine game winner
+        # Determine winner
         if len(self.player1.hand) > len(self.player2.hand):
             game_winner = self.player1
         elif len(self.player2.hand) > len(self.player1.hand):
             game_winner = self.player2
         else:
-            # In case of a tie, player 1 wins
-            game_winner = self.player1
+            p1_total = sum(sum(card['stats'].values()) for card in self.player1.hand)
+            p2_total = sum(sum(card['stats'].values()) for card in self.player2.hand)
+            game_winner = self.player1 if p1_total >= p2_total else self.player2
             
+        print("\nGame Over!")
+        print(f"Winner: {game_winner.name}")
+        print(f"Final Score - {self.player1.name}: {len(self.player1.hand)} cards, {self.player2.name}: {len(self.player2.hand)} cards")
+        
         return game_winner, self.game_history
 
-    def _update_hmm_state(self, round_data: dict):
-        # Convert round data to observation sequence
-        obs = self._round_to_observation(round_data)
-        if self.hmm_model:
-            self.hmm_model.predict(obs.reshape(1, -1))
+def create_hmm(n_attributes: int) -> HiddenMarkovModel:
+    """Create and initialize HMM with proper smoothing"""
+    states = []
+    
+    # Create 3 states (representing different game situations)
+    for i in range(3):
+        # Initialize distribution with pseudocounts
+        dist = {j: 1.0/n_attributes for j in range(n_attributes)}
+        distribution = DiscreteDistribution(dist)
+        states.append(State(distribution, name=f"State{i}"))
 
-    def _round_to_observation(self, round_data: dict) -> np.ndarray:
-        # Convert round data to numerical observation
-        attr_idx = list(self.deck.attributes).index(round_data['selected_attr'])
-        outcome = 1 if round_data['winner'] == self.player1.name else 0
-        return np.array([attr_idx, outcome])
+    # Create model
+    model = HiddenMarkovModel()
+    model.add_states(states)
+    
+    # Add transitions with equal probabilities
+    for state1 in states:
+        for state2 in states:
+            model.add_transition(state1, state2, 1.0/3)
+        model.add_transition(model.start, state1, 1.0/3)
+    
+    model.bake()
+    return model
 
-async def train_model(training_decks: List[str], n_games: int = 50, epochs: int = 5) -> hmm.MultinomialHMM:
-    """Train HMM model using multiple games with fast training players"""
+async def train_model(training_decks: List[str], validation_decks: List[str], 
+                     n_games: int = 1000, epochs: int = 5) -> HiddenMarkovModel:
+    """Train HMM model using multiple games"""
+    # Get number of attributes from first deck
+    first_deck = TopTrumpsDeck(training_decks[0])
+    n_attributes = len(first_deck.attributes)
+    
+    model = create_hmm(n_attributes)
     best_model = None
     best_win_rate = 0
-    n_states = 5
+    no_improvement_count = 0
     
-    print("\nStarting Training:")
+    print("\nStarting Training Phase")
     print("=" * 50)
     
     for epoch in range(epochs):
         print(f"\nEpoch {epoch + 1}/{epochs}")
         print("-" * 30)
         
-        # Initialize model for categorical observations
-        model = hmm.MultinomialHMM(
-            n_components=n_states,
-            n_iter=100,
-            init_params="ste",
-            random_state=epoch
-        )
+        training_stats = TrainingStats()
         
-        all_observations = []
-        stats = TrainingStats()
-        
-        games_per_deck = min(50, n_games)
-        total_games = len(training_decks) * games_per_deck
-        
-        for deck_idx, deck_path in enumerate(training_decks):
-            deck = TopTrumpsDeck(deck_path)
-            deck_name = Path(deck_path).stem
-            p1 = TrainingPlayer("Player1")
-            p2 = TrainingPlayer("Player2")
-            
-            print(f"\nDeck: {deck_name}")
-            
-            for game_num in range(games_per_deck):
-                game = TopTrumpsGame(deck, p1, p2)
-                winner, history = await game.play_game()
-                
-                if winner:
-                    stats.update(history, winner.name)
-                    observations = np.array([game._round_to_observation(round_data) 
-                                          for round_data in history])
-                    all_observations.append(observations)
-                
-                # Update progress
-                progress = ((deck_idx * games_per_deck + game_num + 1) / total_games) * 100
-                print(f"\rProgress: {progress:.1f}% | Win Rate: {stats.win_rate:.1f}%", end="")
-        
-        print("\n")  # New line after deck completion
-        
-        # Fit model
-        if all_observations:
-            obs_matrix = np.concatenate(all_observations)
-            lengths = [len(obs) for obs in all_observations]
+        for deck_path in training_decks:
             try:
-                model.fit(obs_matrix, lengths)
+                deck = TopTrumpsDeck(deck_path)
+                deck_name = Path(deck_path).stem
                 
-                if stats.win_rate > best_win_rate:
-                    best_win_rate = stats.win_rate
-                    best_model = model
-                    print(f"New best model: {best_win_rate:.1f}% win rate")
+                print(f"\nTraining on deck: {deck_name}")
+                progress_interval = max(1, n_games // 20)
                 
+                for game_num in range(n_games // len(training_decks)):
+                    p1 = AIPlayer("Player1", model)
+                    p2 = AIPlayer("Player2", None)  # Second player uses simple strategy
+                    game = TopTrumpsGame(deck, p1, p2)
+                    
+                    winner, history = await game.play_game()
+                    
+                    if history:
+                        training_stats.update(history, winner.name if winner else "draw")
+                        
+                        # Convert history to training sequence
+                        sequence = []
+                        for round_data in history:
+                            attr_idx = deck.attributes.index(round_data['selected_attr'])
+                            sequence.append(attr_idx)
+                        
+                        if len(sequence) > 1:
+                            model.fit([sequence], algorithm='baum-welch', 
+                                    min_iterations=1, max_iterations=5)
+                    
+                    if game_num % progress_interval == 0:
+                        print(f"\rProgress: {game_num}/{n_games//len(training_decks)} | {training_stats}", end="")
+                        
             except Exception as e:
-                print(f"Model fitting failed: {str(e)}")
+                logger.error(f"Error processing deck {deck_path}: {e}")
                 continue
-    
-    if best_model is None:
-        raise RuntimeError("Failed to train any successful models")
-    
+        
+        # Validation phase
+        print("\n\nValidating model...")
+        val_stats = TrainingStats()
+        
+        for deck_path in validation_decks:
+            try:
+                deck = TopTrumpsDeck(deck_path)
+                for _ in range(50):  # 50 validation games per deck
+                    p1 = AIPlayer("Player1", model)
+                    p2 = AIPlayer("Player2", None)
+                    game = TopTrumpsGame(deck, p1, p2)
+                    winner, history = await game.play_game()
+                    if history:
+                        val_stats.update(history, winner.name if winner else "draw")
+            
+            except Exception as e:
+                logger.error(f"Error validating with deck {deck_path}: {e}")
+                continue
+        
+        print(f"\nValidation Results: {val_stats}")
+        
+        # Check for improvement
+        if val_stats.win_rate > best_win_rate:
+            best_win_rate = val_stats.win_rate
+            best_model = deepcopy(model)
+            print(f"New best model: {val_stats.win_rate:.1f}% win rate")
+            no_improvement_count = 0
+        else:
+            no_improvement_count += 1
+            
+        # Early stopping
+        if no_improvement_count >= 2:
+            print("\nNo improvement for 2 epochs - stopping training")
+            break
+            
     print("\nTraining Complete!")
-    print(f"Final Best Model Win Rate: {best_win_rate:.1f}%")
-    return best_model
+    return best_model or model
 
 async def main():
+    """Main execution"""
     parser = argparse.ArgumentParser(description='Top Trumps Game')
     parser.add_argument('mode', choices=['train', 'demo', 'human'])
     parser.add_argument('deck', nargs='?', help='Deck file for demo/human mode')
+    parser.add_argument('--output', help='Directory to save model', default='.')
     args = parser.parse_args()
 
     if args.mode == 'train':
-        # Training mode
         training_decks = [
             'Top_Trumps_Baby_Animals.csv',
             'Top_Trumps_Cats.csv',
@@ -414,45 +474,73 @@ async def main():
             'Top_Trumps_Harry_Potter_and_the_Deathly_Hallows_Part_2.csv',
             'Top_Trumps_New_York_City.csv',
             'Top_Trumps_Seattle_JSM2015.csv',
+            'Top_Trumps_the_Big_Bang_Theory.csv',
+            'Top_Trumps_The_Muppet_Show.csv',
+            'Top_Trumps_the_Simpsons.csv',
+            'Top_Trumps_Transformers_Celebrating_30_Years.csv'
+        ]
+        
+        validation_decks = [
             'Top_Trumps_Skyscrapers.csv',
             'Top_Trumps_Star_Wars_Rise_of_the_Bounty_Hunters.csv',
             'Top_Trumps_Star_Wars_Starships.csv',
             'Top_Trumps_The_Art_Game.csv'
         ]
+        
         print("\nInitializing Top Trumps Training")
-        print("Using first 15 decks for training")
-        model = await train_model(training_decks, n_games=1000, epochs=5)
+        print(f"Training decks: {len(training_decks)}")
+        print(f"Validation decks: {len(validation_decks)}")
         
-        model_path = 'best_hmm_model.pkl'
-        with open(model_path, 'wb') as f:
-            pickle.dump(model, f)
-        print(f"\nBest model saved to {model_path}")
+        try:
+            model = await train_model(training_decks, validation_decks)
+            
+            output_path = Path(args.output)
+            output_path.mkdir(exist_ok=True)
+            
+            with open(output_path / 'model.pkl', 'wb') as f:
+                pickle.dump(model, f)
+            print("\nModel saved successfully")
+            
+        except Exception as e:
+            logger.error(f"Error during training: {e}")
+            return
 
-    else:
-        # Load model for demo/human mode
-        with open('best_hmm_model.pkl', 'rb') as f:
-            model = pickle.load(f)
-        
-        deck = TopTrumpsDeck(args.deck)
-        ollama = OllamaLLM()
-        
-        if args.mode == 'human':
-            game = TopTrumpsGame(
-                deck,
-                HumanPlayer("Human"),
-                LLMPlayer("AI", ollama),
-                model
-            )
-        else:  # demo mode
-            game = TopTrumpsGame(
-                deck,
-                LLMPlayer("AI1", ollama),
-                LLMPlayer("AI2", ollama),
-                model
-            )
-        
-        winner, history = await game.play_game()
-        logger.info(f"Game complete. Winner: {winner.name}")
+    else:  # demo or human mode
+        if not args.deck:
+            print("Error: Deck file required for demo/human mode")
+            return
+            
+        try:
+            with open('model.pkl', 'rb') as f:
+                model = pickle.load(f)
+            
+            deck = TopTrumpsDeck(args.deck)
+            
+            if args.mode == 'human':
+                print("\nStarting Human vs AI game...")
+                game = TopTrumpsGame(
+                    deck,
+                    HumanPlayer("Human"),
+                    AIPlayer("AI", model)
+                )
+            else:  # demo mode
+                print("\nStarting AI vs AI demo game...")
+                game = TopTrumpsGame(
+                    deck,
+                    AIPlayer("AI1", model),
+                    AIPlayer("AI2", model)
+                )
+            
+            winner, history = await game.play_game()
+            
+            print("\nFinal Statistics:")
+            print(f"Total rounds played: {len(history)}")
+            print(f"Winner: {winner.name if winner else 'Draw'}")
+            
+        except FileNotFoundError:
+            print("Error: Model file not found. Please train models first.")
+        except Exception as e:
+            logger.error(f"Error during gameplay: {e}")
 
 if __name__ == "__main__":
     asyncio.run(main())
