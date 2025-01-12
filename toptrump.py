@@ -39,6 +39,7 @@ class TopTrumpsDeck:
             # All other columns are potential attributes
             valid_attributes = []
             attribute_stats = {}
+            processed_df = df.copy()  # Create a copy for processing
             
             for col in df.columns[1:]:  # Skip the first (identifier) column
                 # Create a working copy of the column
@@ -75,36 +76,41 @@ class TopTrumpsDeck:
                     
                     attribute_stats[col] = stats
                     
-                    # Store the processed numeric values back in the dataframe
-                    df[col] = numeric_series
+                    # Store the processed numeric values in the processed dataframe
+                    processed_df[col] = numeric_series
             
             self.attributes = valid_attributes
             self.attribute_stats = attribute_stats
             
+            # Store original values before normalization
+            original_values = processed_df[valid_attributes].copy()
+            
             # Normalize values
             for attr in self.attributes:
-                numeric_vals = df[attr].astype(float)
+                numeric_vals = processed_df[attr].astype(float)
                 stats = attribute_stats[attr]
                 
                 # Use min-max scaling
-                df[attr] = ((numeric_vals - stats['min']) / stats['range']) * 100
+                processed_df[attr] = ((numeric_vals - stats['min']) / stats['range']) * 100
                 
                 # Ensure values are within 0-100 range
-                df[attr] = df[attr].clip(0, 100)
+                processed_df[attr] = processed_df[attr].clip(0, 100)
                 
                 # Update stats with normalized values
-                norm_series = df[attr]
+                norm_series = processed_df[attr]
                 attribute_stats[attr].update({
                     'norm_mean': float(norm_series.mean()),
                     'norm_std': float(norm_series.std())
                 })
             
-            # Convert deck to list of dictionaries
-            for _, row in df.iterrows():
+            # Convert deck to list of dictionaries with both normalized and display stats
+            for idx, row in processed_df.iterrows():
                 card = {
-                    'name': str(row[identifier_col]),  # Convert to string to handle any type
+                    'name': str(df[identifier_col].iloc[idx]),  # Use original df for name
                     'stats': {attr: float(row[attr]) 
-                             for attr in self.attributes}
+                             for attr in self.attributes},
+                    'display_stats': {attr: float(original_values[attr].iloc[idx]) 
+                                    for attr in self.attributes}
                 }
                 self.cards.append(card)
                 
@@ -231,8 +237,9 @@ class HumanPlayer(Player):
         print("-"*50)
         print("Attributes:")
         
-        # Always use display_stats for showing values
-        for i, (attr, value) in enumerate(card['display_stats'].items(), 1):
+        # Make sure we're showing original values, with fallback to normalized if display_stats not available
+        display_values = card.get('display_stats', card['stats'])
+        for i, (attr, value) in enumerate(display_values.items(), 1):
             print(f"{i}. {attr}: {value}")
         print("="*50)
         
@@ -260,7 +267,8 @@ class TopTrumpsGame:
 
     def _deal_cards(self):
         """Deal cards with shuffle verification"""
-        cards = self.deck.cards.copy()
+        # Create deep copies of cards to ensure all attributes are preserved
+        cards = [deepcopy(card) for card in self.deck.cards]
         random.shuffle(cards)
         
         if len(cards) >= 10:
@@ -285,9 +293,12 @@ class TopTrumpsGame:
         print(f"{self.player1.name}'s card: {p1_card['name']:<30} {self.player2.name}'s card: {p2_card['name']}")
         print(f"Selected attribute: {selected_attr}")
         
-        # Always use display_stats for showing values
-        p1_val = p1_card['display_stats'][selected_attr]
-        p2_val = p2_card['display_stats'][selected_attr]
+        # Get display values with fallback to normalized values if needed
+        p1_display = p1_card.get('display_stats', p1_card['stats'])
+        p2_display = p2_card.get('display_stats', p2_card['stats'])
+        
+        p1_val = p1_display[selected_attr]
+        p2_val = p2_display[selected_attr]
         print(f"Values: {self.player1.name}: {p1_val} vs {self.player2.name}: {p2_val}")
         print("-"*60)
 
@@ -344,16 +355,13 @@ class TopTrumpsGame:
             input("\nPress Enter to continue...")
         
         return winner, round_data
+
     async def play_game(self) -> Tuple[Optional[Player], List[dict]]:
         """Play full game"""
         self._deal_cards()
         current_player = self.player1
         rounds_played = 0
         max_rounds = min(100, len(self.deck.cards) * 2)
-        
-        #print("\nGame Started!")
-        #print(f"{self.player1.name} vs {self.player2.name}")
-        #print(f"Initial cards: {len(self.player1.hand)} each")
         
         while self.player1.hand and self.player2.hand and rounds_played < max_rounds:
             opponent = self.player2 if current_player == self.player1 else self.player1
@@ -364,16 +372,20 @@ class TopTrumpsGame:
                 if len(self.player1.hand) > 0 and len(self.player2.hand) > 0:
                     p1_card = self.player1.hand.pop(0)
                     p2_card = self.player2.hand.pop(0)
+                    
+                    # Create deep copies to preserve display_stats
+                    p1_card_copy = deepcopy(p1_card)
+                    p2_card_copy = deepcopy(p2_card)
                 
                     if winner == self.player1:
-                        self.player1.hand.extend([p1_card, p2_card])
+                        self.player1.hand.extend([p1_card_copy, p2_card_copy])
                         current_player = self.player1
                     elif winner == self.player2:
-                        self.player2.hand.extend([p1_card, p2_card])
+                        self.player2.hand.extend([p1_card_copy, p2_card_copy])
                         current_player = self.player2
                     else:
-                        self.player1.hand.append(p1_card)
-                        self.player2.hand.append(p2_card)
+                        self.player1.hand.append(p1_card_copy)
+                        self.player2.hand.append(p2_card_copy)
                         current_player = opponent
                 
             except KeyboardInterrupt:
