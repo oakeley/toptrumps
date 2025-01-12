@@ -86,8 +86,10 @@ class TopTrumpsDeck:
 
     def _load_deck(self):
         try:
+            print(f"Loading deck from {self.csv_path}")  # Debug print
             df = pd.read_csv(self.csv_path)
             self.attributes = [col for col in df.columns if col != 'Individual']
+            print(f"Found attributes: {self.attributes}")  # Debug print
             
             # Convert deck to list of dictionaries
             for _, row in df.iterrows():
@@ -97,6 +99,7 @@ class TopTrumpsDeck:
                             for attr in self.attributes}
                 }
                 self.cards.append(card)
+            print(f"Loaded {len(self.cards)} cards")  # Debug print
                 
         except Exception as e:
             logger.error(f"Error loading deck from {self.csv_path}: {e}")
@@ -111,6 +114,11 @@ class TopTrumpsDeck:
             if value.lower() == "yes":
                 return 1.0
             elif value.lower() == "no":
+                return 0.0
+            try:
+                # Try to convert string numbers with potential commas
+                return float(value.replace(',', ''))
+            except ValueError:
                 return 0.0
         try:
             return float(value)
@@ -131,6 +139,7 @@ class TrainingPlayer(Player):
     def __init__(self, name: str):
         super().__init__(name)
         self.attribute_stats = {}  # Track success rate of attributes
+        self.debug = True  # Enable debug output
 
     async def choose_attribute(self, card: dict) -> str:
         if not self.attribute_stats:
@@ -138,9 +147,10 @@ class TrainingPlayer(Player):
             for attr in card['stats'].keys():
                 self.attribute_stats[attr] = {'wins': 1, 'total': 2}  # Laplace smoothing
         
-        # Choose attribute with best win rate
-        best_attr = max(self.attribute_stats.items(), 
-                       key=lambda x: x[1]['wins'] / x[1]['total'])
+        # Choose attribute with best value in current card
+        best_attr = max(card['stats'].items(), key=lambda x: x[1])
+        if self.debug:
+            print(f"{self.name} choosing {best_attr[0]} with value {best_attr[1]}")
         return best_attr[0]
 
     def update_stats(self, attribute: str, won: bool):
@@ -201,14 +211,23 @@ class TopTrumpsGame:
         self.player2 = player2
         self.hmm_model = hmm_model
         self.game_history = []
+        self.debug = True  # Enable debug output
 
     def _deal_cards(self):
-        random.shuffle(self.deck.cards)
-        mid = len(self.deck.cards) // 2
-        self.player1.hand = self.deck.cards[:mid]
-        self.player2.hand = self.deck.cards[mid:]
+        cards = self.deck.cards.copy()  # Make a copy to avoid modifying original
+        random.shuffle(cards)
+        mid = len(cards) // 2
+        self.player1.hand = cards[:mid]
+        self.player2.hand = cards[mid:]
+        if self.debug:
+            print(f"Dealt {len(self.player1.hand)} cards to each player")
 
-    async def play_round(self, current_player: Player, opponent: Player) -> Tuple[Player, dict]:
+    async def play_round(self, current_player: Player, opponent: Player) -> Tuple[Optional[Player], dict]:
+        if not self.player1.hand or not self.player2.hand:
+            if self.debug:
+                print("Warning: One player has no cards!")
+            return None, {}
+
         p1_card = self.player1.hand[0]
         p2_card = self.player2.hand[0]
         
@@ -217,6 +236,11 @@ class TopTrumpsGame:
             p1_card if current_player == self.player1 else p2_card
         )
         
+        if self.debug:
+            print(f"\nRound detail:")
+            print(f"Player 1 card: {p1_card['name']}, {selected_attr}: {p1_card['stats'][selected_attr]}")
+            print(f"Player 2 card: {p2_card['name']}, {selected_attr}: {p2_card['stats'][selected_attr]}")
+        
         # Compare values
         p1_val = p1_card['stats'][selected_attr]
         p2_val = p2_card['stats'][selected_attr]
@@ -224,10 +248,16 @@ class TopTrumpsGame:
         # Determine winner
         if p1_val > p2_val:
             winner = self.player1
+            if self.debug:
+                print("Player 1 wins round")
         elif p2_val > p1_val:
             winner = self.player2
+            if self.debug:
+                print("Player 2 wins round")
         else:
             winner = None
+            if self.debug:
+                print("Round is a draw")
             
         # Record round
         round_data = {
@@ -240,33 +270,51 @@ class TopTrumpsGame:
         
         return winner, round_data
 
-    async def play_game(self) -> Tuple[Player, List[dict]]:
+    async def play_game(self) -> Tuple[Optional[Player], List[dict]]:
         self._deal_cards()
         current_player = self.player1
+        rounds_played = 0
+        max_rounds = 100  # Prevent infinite games
         
-        while self.player1.hand and self.player2.hand:
+        while self.player1.hand and self.player2.hand and rounds_played < max_rounds:
             winner, round_data = await self.play_round(
                 current_player,
                 self.player2 if current_player == self.player1 else self.player1
             )
             
             # Move cards
-            p1_card = self.player1.hand.pop(0)
-            p2_card = self.player2.hand.pop(0)
+            try:
+                p1_card = self.player1.hand.pop(0)
+                p2_card = self.player2.hand.pop(0)
             
-            if winner == self.player1:
-                self.player1.hand.extend([p1_card, p2_card])
-                current_player = self.player1
-            elif winner == self.player2:
-                self.player2.hand.extend([p1_card, p2_card])
-                current_player = self.player2
-            # On draw, cards are discarded
+                if winner == self.player1:
+                    self.player1.hand.extend([p1_card, p2_card])
+                    current_player = self.player1
+                elif winner == self.player2:
+                    self.player2.hand.extend([p1_card, p2_card])
+                    current_player = self.player2
+                # On draw, cards are discarded
+            except IndexError:
+                if self.debug:
+                    print("Error: Tried to play with empty hands!")
+                break
             
-            # Update HMM if available
-            if self.hmm_model:
-                self._update_hmm_state(round_data)
+            rounds_played += 1
+            if self.debug and rounds_played % 10 == 0:
+                print(f"Round {rounds_played}: P1 cards: {len(self.player1.hand)}, P2 cards: {len(self.player2.hand)}")
         
-        game_winner = self.player1 if len(self.player1.hand) > len(self.player2.hand) else self.player2
+        # Determine game winner
+        if len(self.player1.hand) > len(self.player2.hand):
+            game_winner = self.player1
+        elif len(self.player2.hand) > len(self.player1.hand):
+            game_winner = self.player2
+        else:
+            game_winner = None
+            
+        if self.debug:
+            print(f"Game finished after {rounds_played} rounds")
+            print(f"Final score - P1: {len(self.player1.hand)}, P2: {len(self.player2.hand)}")
+            
         return game_winner, self.game_history
 
     def _update_hmm_state(self, round_data: dict):
@@ -281,7 +329,7 @@ class TopTrumpsGame:
         outcome = 1 if round_data['winner'] == self.player1.name else 0
         return np.array([attr_idx, outcome])
 
-async def train_model(training_decks: List[str], n_games: int = 1000, epochs: int = 5) -> hmm.MultinomialHMM:
+async def train_model(training_decks: List[str], n_games: int = 50, epochs: int = 5) -> hmm.MultinomialHMM:
     """Train HMM model using multiple games with fast training players"""
     best_model = None
     best_win_rate = 0
@@ -306,20 +354,29 @@ async def train_model(training_decks: List[str], n_games: int = 1000, epochs: in
         all_observations = []
         stats = TrainingStats()
         
-        games_per_deck = n_games // len(training_decks)
+        games_per_deck = min(50, n_games)  # Limit to 50 games per deck
         total_games = len(training_decks) * games_per_deck
         
         for deck_idx, deck_path in enumerate(training_decks):
             deck = TopTrumpsDeck(deck_path)
             deck_name = Path(deck_path).stem
-            p1 = TrainingPlayer("Player1")  # Use fast training player
+            p1 = TrainingPlayer("Player1")
             p2 = TrainingPlayer("Player2")
             
             print(f"\nTraining on deck: {deck_name}")
+            deck_stats = {'p1_wins': 0, 'p2_wins': 0, 'draws': 0}
             
             for game_num in range(games_per_deck):
                 game = TopTrumpsGame(deck, p1, p2)
                 winner, history = await game.play_game()
+                
+                # Update game statistics
+                if winner.name == "Player1":
+                    deck_stats['p1_wins'] += 1
+                elif winner.name == "Player2":
+                    deck_stats['p2_wins'] += 1
+                else:
+                    deck_stats['draws'] += 1
                 
                 # Update player stats for better attribute selection
                 for round_data in history:
@@ -331,16 +388,21 @@ async def train_model(training_decks: List[str], n_games: int = 1000, epochs: in
                         p1.update_stats(attr, False)
                         p2.update_stats(attr, True)
                 
-                stats.update(history, winner.name)
+                stats.update(history, winner.name if winner else 'draw')
                 
                 observations = np.array([game._round_to_observation(round_data) 
                                       for round_data in history])
                 all_observations.append(observations)
                 
-                # Update progress every 10 games
-                if (game_num + 1) % 10 == 0:
-                    progress = ((deck_idx * games_per_deck + game_num + 1) / total_games) * 100
-                    print(f"\rProgress: {progress:.1f}% | {stats}", end="")
+                # Update progress after each game
+                progress = ((deck_idx * games_per_deck + game_num + 1) / total_games) * 100
+                deck_win_rate = (deck_stats['p1_wins'] / (game_num + 1)) * 100
+                print(f"\rProgress: {progress:.1f}% | Current Deck: {deck_name} | "
+                      f"Game {game_num + 1}/{games_per_deck} | "
+                      f"Deck Win Rate: {deck_win_rate:.1f}% | "
+                      f"Overall: {stats}", end="")
+        
+        print("\n")  # New line after deck completion
         
         # Fit model with concatenated observations
         if all_observations:
@@ -353,9 +415,9 @@ async def train_model(training_decks: List[str], n_games: int = 1000, epochs: in
                 if stats.win_rate > best_win_rate:
                     best_win_rate = stats.win_rate
                     best_model = model
-                    print(f"\n\nNew best model found! Win Rate: {best_win_rate:.1f}%")
+                    print(f"\nNew best model found! Win Rate: {best_win_rate:.1f}%")
                 else:
-                    print(f"\n\nNo improvement. Current best win rate: {best_win_rate:.1f}%")
+                    print(f"\nNo improvement. Current best win rate: {best_win_rate:.1f}%")
             except Exception as e:
                 print(f"\nWarning: Model fitting failed: {e}")
                 continue
