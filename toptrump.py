@@ -17,33 +17,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-class TrainingStats:
-    """Track training progress and performance"""
-    def __init__(self):
-        self.total_games = 0
-        self.wins_p1 = 0
-        self.total_rounds = 0
-        self.avg_rounds_per_game = 0
-        self.win_rate = 0
-        
-    def update(self, game_history: list, winner_name: str):
-        self.total_games += 1
-        self.wins_p1 += 1 if winner_name == "Player1" else 0
-        self.total_rounds += len(game_history)
-        self.avg_rounds_per_game = self.total_rounds / self.total_games
-        self.win_rate = (self.wins_p1 / self.total_games) * 100
-        
-    def __str__(self):
-        return (f"Win Rate: {self.win_rate:.1f}% | "
-                f"Avg Rounds/Game: {self.avg_rounds_per_game:.1f} | "
-                f"Total Games: {self.total_games}")
-
 class TopTrumpsDeck:
     """Handles deck loading and preprocessing"""
     def __init__(self, csv_path: str):
         self.csv_path = csv_path
         self.cards = []
         self.attributes = []
+        self.attribute_stats = {}
         self._load_deck()
 
     def _load_deck(self):
@@ -55,8 +35,10 @@ class TopTrumpsDeck:
             if 'Individual' not in df.columns:
                 raise ValueError("Deck must have 'Individual' or 'Name' column")
             
-            # First pass: identify numeric columns
+            # First pass: identify numeric columns and analyze distributions
             valid_attributes = []
+            attribute_stats = {}
+            
             for col in df.columns:
                 if col == 'Individual':
                     continue
@@ -70,18 +52,39 @@ class TopTrumpsDeck:
                 # Check if column is mostly numeric
                 if numeric_series.notna().sum() > len(df) * 0.5:
                     valid_attributes.append(col)
+                    
+                    # Calculate distribution statistics
+                    stats = {
+                        'mean': numeric_series.mean(),
+                        'std': numeric_series.std(),
+                        'min': numeric_series.min(),
+                        'max': numeric_series.max(),
+                        'range': numeric_series.max() - numeric_series.min(),
+                        'variance': numeric_series.var()
+                    }
+                    attribute_stats[col] = stats
+                    
+                    # Fill missing values with minimum
                     min_val = numeric_series[numeric_series.notna()].min()
                     df.loc[numeric_series.isna(), col] = min_val
             
             self.attributes = valid_attributes
+            self.attribute_stats = attribute_stats
             
-            # Standardize numeric values to 0-100 range
+            # Normalize values considering distribution characteristics
             for attr in self.attributes:
                 numeric_vals = pd.to_numeric(df[attr], errors='coerce')
-                min_val = numeric_vals.min()
-                max_val = numeric_vals.max()
-                if max_val != min_val:
-                    df[attr] = ((numeric_vals - min_val) / (max_val - min_val)) * 100
+                stats = attribute_stats[attr]
+                
+                # Use z-score normalization if distribution is well-behaved
+                if stats['std'] > 0 and stats['range'] > 0:
+                    df[attr] = ((numeric_vals - stats['mean']) / stats['std']) * 20 + 50
+                else:
+                    # Fallback to min-max scaling
+                    df[attr] = ((numeric_vals - stats['min']) / max(stats['range'], 1e-6)) * 100
+                
+                # Clip values to 0-100 range
+                df[attr] = df[attr].clip(0, 100)
             
             # Convert deck to list of dictionaries
             for _, row in df.iterrows():
@@ -120,7 +123,7 @@ class Player:
         self.name = name
         self.hand: List[dict] = []
         self.stats = {'wins': 0, 'losses': 0, 'draws': 0}
-    
+        
     def choose_attribute(self, card: dict) -> str:
         raise NotImplementedError
         
@@ -134,32 +137,77 @@ class Player:
 
 class AIPlayer(Player):
     """AI player using HMM for decisions"""
-    def __init__(self, name: str, hmm_model: Optional[HiddenMarkovModel] = None):
+    def __init__(self, name: str, hmm_models: Optional[Dict[str, HiddenMarkovModel]] = None):
         super().__init__(name)
-        self.hmm_model = hmm_model
+        self.hmm_models = hmm_models
+        self.current_model = None
+        self.current_deck = None
         self.attribute_stats = {}
+        self.observation_history = []
+        
+    def set_deck(self, deck: TopTrumpsDeck):
+        """Set current deck and corresponding model"""
+        self.current_deck = deck
+        if self.hmm_models is not None:
+            deck_name = Path(deck.csv_path).stem
+            self.current_model = self.hmm_models.get(deck_name)
 
     def choose_attribute(self, card: dict) -> str:
-        if self.hmm_model is None or not self.attribute_stats:
+        if self.current_model is None or self.current_deck is None:
             return max(card['stats'].items(), key=lambda x: x[1])[0]
-            
-        # Weight attributes by success rate and current values
+        
+        # Get deck-specific statistics
+        attributes = self.current_deck.attributes
+        attr_indices = {attr: i for i, attr in enumerate(attributes)}
+        
+        # Convert observation history to sequence
+        if self.observation_history:
+            try:
+                # Predict next best attribute based on history
+                sequence = [attr_indices[attr] for attr, _ in self.observation_history]
+                next_state = self.current_model.predict(sequence)[-1]
+                predicted_attr = self.current_model.states[next_state].name
+                
+                # Get predicted attribute's stats
+                attr_stats = self.current_deck.attribute_stats[predicted_attr]
+                predicted_strength = (card['stats'][predicted_attr] - attr_stats['mean']) / attr_stats['std']
+                
+                # If predicted attribute looks strong, use it
+                if predicted_strength > 0.5:
+                    return predicted_attr
+                
+            except Exception as e:
+                logger.debug(f"Prediction error: {e}")
+        
+        # Fallback to statistical approach
         weighted_scores = {}
         for attr, value in card['stats'].items():
-            stats = self.attribute_stats.get(attr, {'win_rate': 0.5})
-            weighted_scores[attr] = value * (0.5 + stats['win_rate'])
+            stats = self.current_deck.attribute_stats[attr]
             
-        return max(weighted_scores.items(), key=lambda x: x[1])[0]
-
-    def update_attribute_stats(self, attribute: str, won: bool):
-        if attribute not in self.attribute_stats:
-            self.attribute_stats[attribute] = {'wins': 0, 'total': 0, 'win_rate': 0.5}
+            # Calculate z-score for this value
+            z_score = (value - stats['mean']) / stats['std'] if stats['std'] > 0 else 0
+            
+            # Consider:
+            # 1. How exceptional this value is (z-score)
+            # 2. How variable this attribute tends to be (std/mean ratio)
+            # 3. Historical success rate
+            variability = stats['std'] / stats['mean'] if stats['mean'] > 0 else 0
+            history_weight = self.attribute_stats.get(attr, {'win_rate': 0.5})['win_rate']
+            
+            weighted_scores[attr] = (
+                z_score * 0.4 +                # How exceptional the value is
+                variability * 0.3 +            # How discriminative the attribute is
+                history_weight * 0.3           # Historical success
+            )
         
-        stats = self.attribute_stats[attribute]
-        stats['total'] += 1
-        if won:
-            stats['wins'] += 1
-        stats['win_rate'] = stats['wins'] / stats['total']
+        chosen_attr = max(weighted_scores.items(), key=lambda x: x[1])[0]
+        return chosen_attr
+        
+    def update_history(self, attribute: str, won: bool):
+        """Update observation history with game results"""
+        self.observation_history.append((attribute, won))
+        if len(self.observation_history) > 10:  # Keep last 10 moves
+            self.observation_history.pop(0)
 
 class HumanPlayer(Player):
     """Human player interface"""
@@ -186,12 +234,13 @@ class HumanPlayer(Player):
 
 class TopTrumpsGame:
     """Main game logic"""
-    def __init__(self, deck: TopTrumpsDeck, player1: Player, player2: Player):
+    def __init__(self, deck: TopTrumpsDeck, player1: Player, player2: Player, mode: str = 'train'):
         self.deck = deck
         self.player1 = player1
         self.player2 = player2
         self.game_history = []
         self.round_number = 0
+        self.mode = mode
 
     def _deal_cards(self):
         """Deal cards with shuffle verification"""
@@ -257,9 +306,10 @@ class TopTrumpsGame:
             print(f"{self.player2.name} wins the round!")
             self.player1.update_stats(False)
             self.player2.update_stats(True)
-        
+            
+        # Update AI players' history
         if isinstance(current_player, AIPlayer):
-            current_player.update_attribute_stats(selected_attr, winner == current_player)
+            current_player.update_history(selected_attr, winner == current_player)
         
         round_data = {
             'round': self.round_number,
@@ -271,8 +321,8 @@ class TopTrumpsGame:
         }
         self.game_history.append(round_data)
         
-        # In demo mode (AI vs AI), pause after each round
-        if isinstance(self.player1, AIPlayer) and isinstance(self.player2, AIPlayer):
+        # Only pause during demo mode (when both players are AI)
+        if isinstance(self.player1, AIPlayer) and isinstance(self.player2, AIPlayer) and self.mode == 'demo':
             input("\nPress Enter to continue...")
         
         return winner, round_data
@@ -317,7 +367,8 @@ class TopTrumpsGame:
                 break
             
             rounds_played += 1
-            print(f"Cards remaining - {self.player1.name}: {len(self.player1.hand)}, {self.player2.name}: {len(self.player2.hand)}")
+            if self.mode != 'train':
+                print(f"Cards remaining - {self.player1.name}: {len(self.player1.hand)}, {self.player2.name}: {len(self.player2.hand)}")
         
         # Determine winner
         if len(self.player1.hand) > len(self.player2.hand):
@@ -335,41 +386,103 @@ class TopTrumpsGame:
         
         return game_winner, self.game_history
 
-def create_hmm(n_attributes: int) -> HiddenMarkovModel:
-    """Create and initialize HMM with proper smoothing"""
+def create_hmm(deck: TopTrumpsDeck) -> HiddenMarkovModel:
+    """Create HMM where states represent the best attribute to choose"""
     states = []
+    n_attributes = len(deck.attributes)
     
-    # Create 3 states (representing different game situations)
-    for i in range(3):
-        # Initialize distribution with pseudocounts
-        dist = {j: 1.0/n_attributes for j in range(n_attributes)}
+    # Create a state for each attribute
+    for i, attr in enumerate(deck.attributes):
+        # Initialize distribution based on attribute statistics
+        stats = deck.attribute_stats[attr]
+        
+        # Calculate initial emission probabilities based on value distribution
+        # Higher variance means attribute is more discriminative
+        variance_weight = stats['variance'] / (stats['mean'] ** 2) if stats['mean'] > 0 else 0
+        
+        # Create emission distribution favoring this attribute
+        dist = {}
+        for j in range(n_attributes):
+            if j == i:
+                dist[j] = 0.5  # 50% chance of emitting its own attribute
+            else:
+                dist[j] = 0.5 / (n_attributes - 1)  # Evenly split remaining probability
+                
         distribution = DiscreteDistribution(dist)
-        states.append(State(distribution, name=f"State{i}"))
+        states.append(State(distribution, name=attr))
 
     # Create model
     model = HiddenMarkovModel()
     model.add_states(states)
     
-    # Add transitions with equal probabilities
-    for state1 in states:
-        for state2 in states:
-            model.add_transition(state1, state2, 1.0/3)
-        model.add_transition(model.start, state1, 1.0/3)
+    # Initialize transitions based on attribute correlations
+    for i, state1 in enumerate(states):
+        attr1 = deck.attributes[i]
+        
+        # Calculate transition probabilities based on attribute relationships
+        total_weight = 0
+        weights = []
+        
+        for j, state2 in enumerate(states):
+            attr2 = deck.attributes[j]
+            if i == j:
+                # Favor staying in same state if attribute has been successful
+                weight = 0.4
+            else:
+                # Base transition probability on relative attribute strengths
+                stat1 = deck.attribute_stats[attr1]
+                stat2 = deck.attribute_stats[attr2]
+                
+                # Compare distributions
+                mean_diff = abs(stat1['mean'] - stat2['mean'])
+                var_ratio = max(stat1['variance'], stat2['variance']) / (min(stat1['variance'], stat2['variance']) + 1e-6)
+                
+                weight = 1.0 / (1.0 + mean_diff * var_ratio)
+            
+            weights.append(weight)
+            total_weight += weight
+        
+        # Normalize weights to probabilities
+        for j, weight in enumerate(weights):
+            prob = weight / total_weight
+            model.add_transition(state1, states[j], prob)
+            
+        # Add start probabilities - favor attributes with higher mean values initially
+        start_weight = deck.attribute_stats[attr1]['mean'] / 100.0
+        model.add_transition(model.start, state1, start_weight)
     
     model.bake()
     return model
 
-async def train_model(training_decks: List[str], validation_decks: List[str], 
-                     n_games: int = 1000, epochs: int = 5) -> HiddenMarkovModel:
-    """Train HMM model using multiple games"""
-    # Get number of attributes from first deck
-    first_deck = TopTrumpsDeck(training_decks[0])
-    n_attributes = len(first_deck.attributes)
+async def train_model(decks: List[str], n_games: int = 1000, epochs: int = 5) -> Dict[str, HiddenMarkovModel]:
+    """Train HMM models for each deck type"""
+    deck_models = {}
     
-    model = create_hmm(n_attributes)
-    best_model = None
-    best_win_rate = 0
-    no_improvement_count = 0
+    print("\nAnalyzing deck characteristics...")
+    # First pass: analyze all decks to understand attribute distributions
+    for deck_path in decks:
+        deck_name = Path(deck_path).stem
+        print(f"\nAnalyzing {deck_name}")
+        
+        try:
+            deck = TopTrumpsDeck(deck_path)
+            # Create initial model based on deck statistics
+            model = create_hmm(deck)
+            deck_models[deck_name] = model
+            
+            # Output initial attribute analysis
+            print("\nAttribute Statistics:")
+            for attr in deck.attributes:
+                stats = deck.attribute_stats[attr]
+                print(f"\n{attr}:")
+                print(f"  Mean: {stats['mean']:.2f}")
+                print(f"  Std Dev: {stats['std']:.2f}")
+                print(f"  Range: {stats['range']:.2f}")
+                print(f"  Variance: {stats['variance']:.2f}")
+                
+        except Exception as e:
+            logger.error(f"Error analyzing deck {deck_path}: {e}")
+            continue
     
     print("\nStarting Training Phase")
     print("=" * 50)
@@ -378,91 +491,84 @@ async def train_model(training_decks: List[str], validation_decks: List[str],
         print(f"\nEpoch {epoch + 1}/{epochs}")
         print("-" * 30)
         
-        training_stats = TrainingStats()
+        # Track stats for each deck separately
+        deck_stats = {}
         
-        for deck_path in training_decks:
+        for deck_path in decks:
+            deck_name = Path(deck_path).stem
             try:
                 deck = TopTrumpsDeck(deck_path)
-                deck_name = Path(deck_path).stem
+                model = deck_models[deck_name]
                 
                 print(f"\nTraining on deck: {deck_name}")
-                progress_interval = max(1, n_games // 20)
+                progress_interval = max(1, n_games // len(decks) // 10)
                 
-                for game_num in range(n_games // len(training_decks)):
-                    p1 = AIPlayer("Player1", model)
+                for game_num in range(n_games // len(decks)):
+                    p1 = AIPlayer("Player1", {deck_name: model})
                     p2 = AIPlayer("Player2", None)  # Second player uses simple strategy
-                    game = TopTrumpsGame(deck, p1, p2)
                     
+                    # Set current deck for p1
+                    p1.set_deck(deck)
+                    
+                    game = TopTrumpsGame(deck, p1, p2, mode='train')
                     winner, history = await game.play_game()
                     
+                    if deck_name not in deck_stats:
+                        deck_stats[deck_name] = {'wins': 0, 'total': 0}
+                    
+                    deck_stats[deck_name]['total'] += 1
+                    if winner == p1:
+                        deck_stats[deck_name]['wins'] += 1
+                    
+                    # Update model with game history
                     if history:
-                        training_stats.update(history, winner.name if winner else "draw")
-                        
-                        # Convert history to training sequence
                         sequence = []
                         for round_data in history:
                             attr_idx = deck.attributes.index(round_data['selected_attr'])
                             sequence.append(attr_idx)
                         
                         if len(sequence) > 1:
-                            model.fit([sequence], algorithm='baum-welch', 
-                                    min_iterations=1, max_iterations=5)
+                            model.fit([sequence], algorithm='baum-welch', min_iterations=1, max_iterations=5)
                     
                     if game_num % progress_interval == 0:
-                        print(f"\rProgress: {game_num}/{n_games//len(training_decks)} | {training_stats}", end="")
-                        
+                        win_rate = deck_stats[deck_name]['wins'] / deck_stats[deck_name]['total'] * 100
+                        print(f"\rProgress: {game_num/(n_games//len(decks))*100:.1f}% | Win Rate: {win_rate:.1f}%", end="")
+                
+                print("\n")  # New line after progress
+                
+                # Output final model parameters
+                print("\nState Analysis:")
+                for state in model.states:
+                    if hasattr(state, 'name') and state.name in deck.attributes:
+                        print(f"\nState: {state.name}")
+                        attr_idx = deck.attributes.index(state.name)
+                        # Show top transition probabilities
+                        transitions = []
+                        for next_state in model.states:
+                            if hasattr(next_state, 'name') and next_state.name in deck.attributes:
+                                prob = model.dense_transition_matrix()[attr_idx][deck.attributes.index(next_state.name)]
+                                transitions.append((next_state.name, prob))
+                        transitions.sort(key=lambda x: x[1], reverse=True)
+                        print("Top transitions:")
+                        for attr, prob in transitions[:3]:
+                            print(f"  -> {attr}: {prob:.3f}")
+                
             except Exception as e:
-                logger.error(f"Error processing deck {deck_path}: {e}")
+                logger.error(f"Error training on deck {deck_path}: {e}")
                 continue
-        
-        # Validation phase
-        print("\n\nValidating model...")
-        val_stats = TrainingStats()
-        
-        for deck_path in validation_decks:
-            try:
-                deck = TopTrumpsDeck(deck_path)
-                for _ in range(50):  # 50 validation games per deck
-                    p1 = AIPlayer("Player1", model)
-                    p2 = AIPlayer("Player2", None)
-                    game = TopTrumpsGame(deck, p1, p2)
-                    winner, history = await game.play_game()
-                    if history:
-                        val_stats.update(history, winner.name if winner else "draw")
-            
-            except Exception as e:
-                logger.error(f"Error validating with deck {deck_path}: {e}")
-                continue
-        
-        print(f"\nValidation Results: {val_stats}")
-        
-        # Check for improvement
-        if val_stats.win_rate > best_win_rate:
-            best_win_rate = val_stats.win_rate
-            best_model = deepcopy(model)
-            print(f"New best model: {val_stats.win_rate:.1f}% win rate")
-            no_improvement_count = 0
-        else:
-            no_improvement_count += 1
-            
-        # Early stopping
-        if no_improvement_count >= 2:
-            print("\nNo improvement for 2 epochs - stopping training")
-            break
-            
-    print("\nTraining Complete!")
-    return best_model or model
+    
+    return deck_models
 
 async def main():
     """Main execution"""
     parser = argparse.ArgumentParser(description='Top Trumps Game')
     parser.add_argument('mode', choices=['train', 'demo', 'human'])
     parser.add_argument('deck', nargs='?', help='Deck file for demo/human mode')
-    parser.add_argument('--output', help='Directory to save model', default='.')
+    parser.add_argument('--output', help='Directory to save models', default='.')
     args = parser.parse_args()
 
     if args.mode == 'train':
-        training_decks = [
+        all_decks = [
             'Top_Trumps_Baby_Animals.csv',
             'Top_Trumps_Cats.csv',
             'Top_Trumps_Chicago_JSM2016.csv',
@@ -474,32 +580,28 @@ async def main():
             'Top_Trumps_Harry_Potter_and_the_Deathly_Hallows_Part_2.csv',
             'Top_Trumps_New_York_City.csv',
             'Top_Trumps_Seattle_JSM2015.csv',
+            'Top_Trumps_Skyscrapers.csv',
+            'Top_Trumps_Star_Wars_Rise_of_the_Bounty_Hunters.csv',
+            'Top_Trumps_Star_Wars_Starships.csv',
+            'Top_Trumps_The_Art_Game.csv',
             'Top_Trumps_the_Big_Bang_Theory.csv',
             'Top_Trumps_The_Muppet_Show.csv',
             'Top_Trumps_the_Simpsons.csv',
             'Top_Trumps_Transformers_Celebrating_30_Years.csv'
         ]
         
-        validation_decks = [
-            'Top_Trumps_Skyscrapers.csv',
-            'Top_Trumps_Star_Wars_Rise_of_the_Bounty_Hunters.csv',
-            'Top_Trumps_Star_Wars_Starships.csv',
-            'Top_Trumps_The_Art_Game.csv'
-        ]
-        
         print("\nInitializing Top Trumps Training")
-        print(f"Training decks: {len(training_decks)}")
-        print(f"Validation decks: {len(validation_decks)}")
+        print(f"Total decks: {len(all_decks)}")
         
         try:
-            model = await train_model(training_decks, validation_decks)
+            models = await train_model(all_decks)
             
             output_path = Path(args.output)
             output_path.mkdir(exist_ok=True)
             
-            with open(output_path / 'model.pkl', 'wb') as f:
-                pickle.dump(model, f)
-            print("\nModel saved successfully")
+            with open(output_path / 'models.pkl', 'wb') as f:
+                pickle.dump(models, f)
+            print("\nModels saved successfully")
             
         except Exception as e:
             logger.error(f"Error during training: {e}")
@@ -511,24 +613,33 @@ async def main():
             return
             
         try:
-            with open('model.pkl', 'rb') as f:
-                model = pickle.load(f)
+            with open('models.pkl', 'rb') as f:
+                models = pickle.load(f)
             
             deck = TopTrumpsDeck(args.deck)
+            deck_name = Path(args.deck).stem
             
             if args.mode == 'human':
                 print("\nStarting Human vs AI game...")
+                ai_player = AIPlayer("AI", models)
+                ai_player.set_deck(deck)
                 game = TopTrumpsGame(
                     deck,
                     HumanPlayer("Human"),
-                    AIPlayer("AI", model)
+                    ai_player,
+                    mode='human'
                 )
             else:  # demo mode
                 print("\nStarting AI vs AI demo game...")
+                p1 = AIPlayer("AI1", models)
+                p2 = AIPlayer("AI2", models)
+                p1.set_deck(deck)
+                p2.set_deck(deck)
                 game = TopTrumpsGame(
                     deck,
-                    AIPlayer("AI1", model),
-                    AIPlayer("AI2", model)
+                    p1,
+                    p2,
+                    mode='demo'
                 )
             
             winner, history = await game.play_game()
@@ -538,7 +649,7 @@ async def main():
             print(f"Winner: {winner.name if winner else 'Draw'}")
             
         except FileNotFoundError:
-            print("Error: Model file not found. Please train models first.")
+            print("Error: Models file not found. Please train models first.")
         except Exception as e:
             logger.error(f"Error during gameplay: {e}")
 
