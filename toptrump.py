@@ -86,10 +86,8 @@ class TopTrumpsDeck:
 
     def _load_deck(self):
         try:
-            print(f"Loading deck from {self.csv_path}")  # Debug print
             df = pd.read_csv(self.csv_path)
             self.attributes = [col for col in df.columns if col != 'Individual']
-            print(f"Found attributes: {self.attributes}")  # Debug print
             
             # Convert deck to list of dictionaries
             for _, row in df.iterrows():
@@ -99,7 +97,6 @@ class TopTrumpsDeck:
                             for attr in self.attributes}
                 }
                 self.cards.append(card)
-            print(f"Loaded {len(self.cards)} cards")  # Debug print
                 
         except Exception as e:
             logger.error(f"Error loading deck from {self.csv_path}: {e}")
@@ -110,13 +107,11 @@ class TopTrumpsDeck:
         if pd.isna(value):
             return 0.0
         if isinstance(value, str):
-            # Handle text values like "Yes"/"No"
             if value.lower() == "yes":
                 return 1.0
             elif value.lower() == "no":
                 return 0.0
             try:
-                # Try to convert string numbers with potential commas
                 return float(value.replace(',', ''))
             except ValueError:
                 return 0.0
@@ -293,15 +288,14 @@ class TopTrumpsGame:
                 elif winner == self.player2:
                     self.player2.hand.extend([p1_card, p2_card])
                     current_player = self.player2
-                # On draw, cards are discarded
+                else:
+                    # On draw, split the cards
+                    self.player1.hand.append(p1_card)
+                    self.player2.hand.append(p2_card)
             except IndexError:
-                if self.debug:
-                    print("Error: Tried to play with empty hands!")
                 break
             
             rounds_played += 1
-            if self.debug and rounds_played % 10 == 0:
-                print(f"Round {rounds_played}: P1 cards: {len(self.player1.hand)}, P2 cards: {len(self.player2.hand)}")
         
         # Determine game winner
         if len(self.player1.hand) > len(self.player2.hand):
@@ -309,11 +303,8 @@ class TopTrumpsGame:
         elif len(self.player2.hand) > len(self.player1.hand):
             game_winner = self.player2
         else:
-            game_winner = None
-            
-        if self.debug:
-            print(f"Game finished after {rounds_played} rounds")
-            print(f"Final score - P1: {len(self.player1.hand)}, P2: {len(self.player2.hand)}")
+            # In case of a tie, player 1 wins
+            game_winner = self.player1
             
         return game_winner, self.game_history
 
@@ -333,28 +324,27 @@ async def train_model(training_decks: List[str], n_games: int = 50, epochs: int 
     """Train HMM model using multiple games with fast training players"""
     best_model = None
     best_win_rate = 0
-    n_states = 5  # Increased number of states for better modeling
+    n_states = 5
     
     print("\nStarting Training:")
     print("=" * 50)
     
     for epoch in range(epochs):
         print(f"\nEpoch {epoch + 1}/{epochs}")
-        print("-" * 50)
+        print("-" * 30)
         
-        # Initialize new model with proper multinomial emission
-        n_attributes = len(TopTrumpsDeck(training_decks[0]).attributes)
+        # Initialize model for categorical observations
         model = hmm.MultinomialHMM(
             n_components=n_states,
             n_iter=100,
-            implementation="scaling",
+            init_params="ste",
             random_state=epoch
         )
         
         all_observations = []
         stats = TrainingStats()
         
-        games_per_deck = min(50, n_games)  # Limit to 50 games per deck
+        games_per_deck = min(50, n_games)
         total_games = len(training_decks) * games_per_deck
         
         for deck_idx, deck_path in enumerate(training_decks):
@@ -363,63 +353,38 @@ async def train_model(training_decks: List[str], n_games: int = 50, epochs: int 
             p1 = TrainingPlayer("Player1")
             p2 = TrainingPlayer("Player2")
             
-            print(f"\nTraining on deck: {deck_name}")
-            deck_stats = {'p1_wins': 0, 'p2_wins': 0, 'draws': 0}
+            print(f"\nDeck: {deck_name}")
             
             for game_num in range(games_per_deck):
                 game = TopTrumpsGame(deck, p1, p2)
                 winner, history = await game.play_game()
                 
-                # Update game statistics
-                if winner.name == "Player1":
-                    deck_stats['p1_wins'] += 1
-                elif winner.name == "Player2":
-                    deck_stats['p2_wins'] += 1
-                else:
-                    deck_stats['draws'] += 1
+                if winner:
+                    stats.update(history, winner.name)
+                    observations = np.array([game._round_to_observation(round_data) 
+                                          for round_data in history])
+                    all_observations.append(observations)
                 
-                # Update player stats for better attribute selection
-                for round_data in history:
-                    attr = round_data['selected_attr']
-                    if round_data['winner'] == 'Player1':
-                        p1.update_stats(attr, True)
-                        p2.update_stats(attr, False)
-                    elif round_data['winner'] == 'Player2':
-                        p1.update_stats(attr, False)
-                        p2.update_stats(attr, True)
-                
-                stats.update(history, winner.name if winner else 'draw')
-                
-                observations = np.array([game._round_to_observation(round_data) 
-                                      for round_data in history])
-                all_observations.append(observations)
-                
-                # Update progress after each game
+                # Update progress
                 progress = ((deck_idx * games_per_deck + game_num + 1) / total_games) * 100
-                deck_win_rate = (deck_stats['p1_wins'] / (game_num + 1)) * 100
-                print(f"\rProgress: {progress:.1f}% | Current Deck: {deck_name} | "
-                      f"Game {game_num + 1}/{games_per_deck} | "
-                      f"Deck Win Rate: {deck_win_rate:.1f}% | "
-                      f"Overall: {stats}", end="")
+                print(f"\rProgress: {progress:.1f}% | Win Rate: {stats.win_rate:.1f}%", end="")
         
         print("\n")  # New line after deck completion
         
-        # Fit model with concatenated observations
+        # Fit model
         if all_observations:
             obs_matrix = np.concatenate(all_observations)
             lengths = [len(obs) for obs in all_observations]
             try:
                 model.fit(obs_matrix, lengths)
                 
-                # Evaluate model
                 if stats.win_rate > best_win_rate:
                     best_win_rate = stats.win_rate
                     best_model = model
-                    print(f"\nNew best model found! Win Rate: {best_win_rate:.1f}%")
-                else:
-                    print(f"\nNo improvement. Current best win rate: {best_win_rate:.1f}%")
+                    print(f"New best model: {best_win_rate:.1f}% win rate")
+                
             except Exception as e:
-                print(f"\nWarning: Model fitting failed: {e}")
+                print(f"Model fitting failed: {str(e)}")
                 continue
     
     if best_model is None:
