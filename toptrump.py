@@ -15,6 +15,29 @@ from pathlib import Path
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+# Disable httpx logging
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+# Progress tracking
+class TrainingStats:
+    def __init__(self):
+        self.total_games = 0
+        self.wins_p1 = 0
+        self.total_rounds = 0
+        self.avg_rounds_per_game = 0
+        self.win_rate = 0
+        
+    def update(self, game_history: list, winner_name: str):
+        self.total_games += 1
+        self.wins_p1 += 1 if winner_name == "Player1" else 0
+        self.total_rounds += len(game_history)
+        self.avg_rounds_per_game = self.total_rounds / self.total_games
+        self.win_rate = (self.wins_p1 / self.total_games) * 100
+        
+    def __str__(self):
+        return (f"Win Rate: {self.win_rate:.1f}% | "
+                f"Avg Rounds/Game: {self.avg_rounds_per_game:.1f} | "
+                f"Total Games: {self.total_games}")
 
 class OllamaLLM:
     """Handles interactions with the Ollama phi4 model"""
@@ -235,28 +258,63 @@ class TopTrumpsGame:
         outcome = 1 if round_data['winner'] == self.player1.name else 0
         return np.array([attr_idx, outcome])
 
-async def train_model(training_decks: List[str], n_games: int = 1000) -> hmm.MultinomialHMM:
+async def train_model(training_decks: List[str], n_games: int = 1000, epochs: int = 5) -> hmm.MultinomialHMM:
     """Train HMM model using multiple games"""
     ollama = OllamaLLM()
-    model = hmm.MultinomialHMM(n_components=3, n_iter=100)
+    best_model = None
+    best_win_rate = 0
     
-    all_observations = []
-    for deck_path in training_decks:
-        deck = TopTrumpsDeck(deck_path)
-        p1 = LLMPlayer("Player1", ollama)
-        p2 = LLMPlayer("Player2", ollama)
+    print("\nStarting Training:")
+    print("=" * 50)
+    
+    for epoch in range(epochs):
+        print(f"\nEpoch {epoch + 1}/{epochs}")
+        print("-" * 50)
         
-        for _ in range(n_games // len(training_decks)):
-            game = TopTrumpsGame(deck, p1, p2)
-            _, history = await game.play_game()
-            observations = np.array([game._round_to_observation(round_data) 
-                                  for round_data in history])
-            all_observations.append(observations)
+        model = hmm.MultinomialHMM(n_components=3, n_iter=100)
+        all_observations = []
+        stats = TrainingStats()
+        
+        games_per_deck = n_games // len(training_decks)
+        total_games = len(training_decks) * games_per_deck
+        
+        for deck_idx, deck_path in enumerate(training_decks):
+            deck = TopTrumpsDeck(deck_path)
+            deck_name = Path(deck_path).stem
+            p1 = LLMPlayer("Player1", ollama)
+            p2 = LLMPlayer("Player2", ollama)
+            
+            print(f"\nTraining on deck: {deck_name}")
+            
+            for game_num in range(games_per_deck):
+                game = TopTrumpsGame(deck, p1, p2)
+                winner, history = await game.play_game()
+                stats.update(history, winner.name)
+                
+                observations = np.array([game._round_to_observation(round_data) 
+                                      for round_data in history])
+                all_observations.append(observations)
+                
+                # Update progress every 10 games
+                if (game_num + 1) % 10 == 0:
+                    progress = ((deck_idx * games_per_deck + game_num + 1) / total_games) * 100
+                    print(f"\rProgress: {progress:.1f}% | {stats}", end="")
+        
+        # Fit model
+        lengths = [len(obs) for obs in all_observations]
+        model.fit(np.concatenate(all_observations), lengths)
+        
+        # Evaluate model
+        if stats.win_rate > best_win_rate:
+            best_win_rate = stats.win_rate
+            best_model = model
+            print(f"\n\nNew best model found! Win Rate: {best_win_rate:.1f}%")
+        else:
+            print(f"\n\nNo improvement. Current best win rate: {best_win_rate:.1f}%")
     
-    # Fit model
-    lengths = [len(obs) for obs in all_observations]
-    model.fit(np.concatenate(all_observations), lengths)
-    return model
+    print("\nTraining Complete!")
+    print(f"Final Best Model Win Rate: {best_win_rate:.1f}%")
+    return best_model
 
 async def main():
     parser = argparse.ArgumentParser(description='Top Trumps Game')
@@ -269,12 +327,28 @@ async def main():
         training_decks = [
             'Top_Trumps_Baby_Animals.csv',
             'Top_Trumps_Cats.csv',
-            # Add other training decks...
+            'Top_Trumps_Chicago_JSM2016.csv',
+            'Top_Trumps_Dinosaurs.csv',
+            'Top_Trumps_Dogs.csv',
+            'Top_Trumps_Dr_Who_45_Years_of_Time_Travel.csv',
+            'Top_Trumps_Elements.csv',
+            'Top_Trumps_Famous_Art_Robberies.csv',
+            'Top_Trumps_Harry_Potter_and_the_Deathly_Hallows_Part_2.csv',
+            'Top_Trumps_New_York_City.csv',
+            'Top_Trumps_Seattle_JSM2015.csv',
+            'Top_Trumps_Skyscrapers.csv',
+            'Top_Trumps_Star_Wars_Rise_of_the_Bounty_Hunters.csv',
+            'Top_Trumps_Star_Wars_Starships.csv',
+            'Top_Trumps_The_Art_Game.csv'
         ]
-        model = await train_model(training_decks)
-        with open('best_hmm_model.pkl', 'wb') as f:
+        print("\nInitializing Top Trumps Training")
+        print("Using first 15 decks for training")
+        model = await train_model(training_decks, n_games=1000, epochs=5)
+        
+        model_path = 'best_hmm_model.pkl'
+        with open(model_path, 'wb') as f:
             pickle.dump(model, f)
-        logger.info("Training complete. Model saved.")
+        print(f"\nBest model saved to {model_path}")
 
     else:
         # Load model for demo/human mode
