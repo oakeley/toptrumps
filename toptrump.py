@@ -1,6 +1,35 @@
+## Edward Oakeley 2025-Jan-12
+
+## Create conda environment
+# conda create -n trump
+# conda activate trump
+# conda install pomegranate -y
+# conda install tenacity -y
+# conda install pandas -y
+# conda install httpx -y
+# conda install typing -y
+# pip install argparse
+
+### Homework
+## 1. Own data
+# git clone https://github.com/APStats/Top-Trumps-data
+## Save original filenames to "start" and new names to "stop"
+# ls Top-Trumps-data/ | grep Top > start; ls Top-Trumps-data/ | grep Top | sed 's/ - //g' | tr " " "" | tr -d "()" | tr -s "_" > stop
+## Join the lists with a tab separator and escape illegal characters in the original filenames. Use awk to execute the commands to copy/rename the files
+# paste start stop | sed 's/ /\ /g' | sed 's/(/\(/g' | sed 's/)/\)/g' | awk -F"\t" '{system("cp Top-Trumps-data/"$1" "$2)}'
+
+## 2. Own discrete actions
+## Training, demo, human mode
+
+## 3. Fantasy reward function
+## Win/lose/draw outcomes
+
+## 4. If you wanted other logic from random choice np.random.choice(self.action_size)
+## Cards are shuffled and dealt randomly
+
 import numpy as np
 import pandas as pd
-from pomegranate import HiddenMarkovModel, State, DiscreteDistribution
+from pomegranate import HiddenMarkovModel, State, DiscreteDistribution # I had a lot of issues with hmmlearn. Google suggested this as an alternative
 import random
 import pickle
 import asyncio
@@ -18,7 +47,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 class TopTrumpsDeck:
-    """Handles deck loading and preprocessing with improved normalization"""
+    # Deck loading and preprocessing with improved normalization
     def __init__(self, csv_path: str):
         self.csv_path = csv_path
         self.cards = []
@@ -33,7 +62,7 @@ class TopTrumpsDeck:
             if len(df.columns) < 2:
                 raise ValueError("Deck must have at least two columns")
             
-            # Always use first column as identifier
+            # Always use first column as identifier (Column titles are essentially random but the first is always the ID)
             identifier_col = df.columns[0]
             
             # All other columns are potential attributes
@@ -46,22 +75,20 @@ class TopTrumpsDeck:
                 working_series = df[col].copy()
                 
                 # Convert special values
-                working_series = working_series.replace('n/a', '0')
-                working_series = working_series.replace('Yes', '100')
-                working_series = working_series.replace('No', '0')
-                working_series = working_series.replace('yes', '100')
-                working_series = working_series.replace('no', '0')
+                working_series = working_series.replace('n/a', '0') # A value of n/a in a numeric column is annoying but "0" should always be the worst score
+                working_series = working_series.replace('Yes', '100') # Make "yes" numeric and the winning score
+                working_series = working_series.replace('No', '0') # Make "no" numeric and the losing score
                 
                 # Try to convert to numeric
-                numeric_series = pd.to_numeric(working_series, errors='coerce')
+                numeric_series = pd.to_numeric(working_series, errors='coerce') # Now force everything else to be numbers
                 
                 # Check if column is mostly numeric (>50% valid numbers)
-                valid_numeric_count = numeric_series.notna().sum()
-                if valid_numeric_count > len(df) * 0.5:
+                valid_numeric_count = numeric_series.notna().sum() # A column of only text will all be "NaN"
+                if valid_numeric_count > len(df) * 0.5: # I think this should probably be kept if it has any numbers but this makes the data cleaner
                     valid_attributes.append(col)
                     
                     # Fill NaN values with 0
-                    numeric_series = numeric_series.fillna(0)
+                    numeric_series = numeric_series.fillna(0) # "NaN" forced to "0" like above
                     
                     # Calculate basic statistics
                     stats = {
@@ -83,11 +110,11 @@ class TopTrumpsDeck:
             self.attribute_stats = attribute_stats
             
             # Store original values before normalization
-            original_values = processed_df[valid_attributes].copy()
+            original_values = processed_df[valid_attributes].copy() # We need the raw values for the game play
             
             # Normalize values
             for attr in self.attributes:
-                numeric_vals = processed_df[attr].astype(float)
+                numeric_vals = processed_df[attr].astype(float) # Float is safer as we are going to be scaling and don't want to lose precision
                 stats = attribute_stats[attr]
                 
                 # Use min-max scaling
@@ -109,7 +136,7 @@ class TopTrumpsDeck:
                     'name': str(df[identifier_col].iloc[idx]),  # Use original df for name
                     'stats': {attr: float(row[attr]) 
                              for attr in self.attributes},
-                    'display_stats': {attr: float(original_values[attr].iloc[idx]) 
+                    'display_stats': {attr: int(original_values[attr].iloc[idx]) 
                                     for attr in self.attributes}
                 }
                 self.cards.append(card)
@@ -118,34 +145,15 @@ class TopTrumpsDeck:
             logger.error(f"Error loading deck from {self.csv_path}: {e}")
             raise
 
-    def _convert_value(self, value) -> float:
-        """Convert string values to numeric, handling special cases"""
-        if pd.isna(value) or value == 'n/a':
-            return 0.0
-        if isinstance(value, str):
-            value = value.lower().strip()
-            if value == "yes":
-                return 100.0
-            elif value == "no":
-                return 0.0
-            try:
-                return float(value.replace(',', ''))
-            except ValueError:
-                return 0.0
-        try:
-            return float(value)
-        except (ValueError, TypeError):
-            return 0.0
-
 class Player:
-    """Base player class"""
+    # Base player class
     def __init__(self, name: str):
         self.name = name
         self.hand: List[dict] = []
-        self.stats = {'wins': 0, 'losses': 0, 'draws': 0}
+        self.stats = {'wins': 0, 'losses': 0, 'draws': 0} # Keep a count of score for the player
         
-    def choose_attribute(self, card: dict) -> str:
-        raise NotImplementedError
+    # def choose_attribute(self, card: dict) -> str:
+    #     raise NotImplementedError
         
     def update_stats(self, won: bool, draw: bool = False):
         if draw:
@@ -156,7 +164,7 @@ class Player:
             self.stats['losses'] += 1
 
 class AIPlayer(Player):
-    """AI player using HMM for decisions"""
+    # AI player using HMM for decisions
     def __init__(self, name: str, hmm_models: Optional[Dict[str, HiddenMarkovModel]] = None):
         super().__init__(name)
         self.hmm_models = hmm_models
@@ -166,7 +174,7 @@ class AIPlayer(Player):
         self.observation_history = []
         
     def set_deck(self, deck: TopTrumpsDeck):
-        """Set current deck and corresponding model"""
+        # Set current deck and corresponding model
         self.current_deck = deck
         if self.hmm_models is not None:
             deck_name = Path(deck.csv_path).stem
@@ -224,13 +232,13 @@ class AIPlayer(Player):
         return chosen_attr
         
     def update_history(self, attribute: str, won: bool):
-        """Update observation history with game results"""
+        # Update observation history with game results
         self.observation_history.append((attribute, won))
         if len(self.observation_history) > 10:  # Keep last 10 moves
             self.observation_history.pop(0)
 
 class HumanPlayer(Player):
-    """Human player interface"""
+    # Human player interface
     def choose_attribute(self, card: dict) -> str:
         print("\n" + "="*50)
         print(f"Your card: {card['name']}")
@@ -256,7 +264,7 @@ class HumanPlayer(Player):
             print("Invalid choice. Try again.")
 
 class TopTrumpsGame:
-    """Main game logic"""
+    # Main game logic
     def __init__(self, deck: TopTrumpsDeck, player1: Player, player2: Player, mode: str = 'train'):
         self.deck = deck
         self.player1 = player1
@@ -266,7 +274,7 @@ class TopTrumpsGame:
         self.mode = mode
 
     def _deal_cards(self):
-        """Deal cards with shuffle verification"""
+        # Deal cards with shuffle verification
         # Create deep copies of cards to ensure all attributes are preserved
         cards = [deepcopy(card) for card in self.deck.cards]
         random.shuffle(cards)
@@ -286,7 +294,7 @@ class TopTrumpsGame:
         self.player2.hand = cards[mid:]
 
     def _display_round(self, p1_card: dict, p2_card: dict, selected_attr: str):
-        """Display round information using original values"""
+        # Display round information using original values
         print("\n" + "="*60)
         print(f"Round {self.round_number}".center(60))
         print("-"*60)
@@ -303,7 +311,7 @@ class TopTrumpsGame:
         print("-"*60)
 
     def play_round(self, current_player: Player, opponent: Player) -> Tuple[Optional[Player], dict]:
-        """Play a single round"""
+        # Play a single round
         self.round_number += 1
         
         if not self.player1.hand or not self.player2.hand:
@@ -351,13 +359,18 @@ class TopTrumpsGame:
         }
         self.game_history.append(round_data)
         
+        # AI mode pause for each round
         if isinstance(self.player1, AIPlayer) and isinstance(self.player2, AIPlayer) and self.mode == 'demo':
+            input("\nPress Enter to continue...")
+
+        # Human mode pause for each round
+        if isinstance(self.player1, HumanPlayer) and isinstance(self.player2, AIPlayer) and self.mode == 'human':
             input("\nPress Enter to continue...")
         
         return winner, round_data
 
     async def play_game(self) -> Tuple[Optional[Player], List[dict]]:
-        """Play full game"""
+        # Play full game
         self._deal_cards()
         current_player = self.player1
         rounds_played = 0
@@ -408,15 +421,11 @@ class TopTrumpsGame:
             p1_total = sum(sum(card['stats'].values()) for card in self.player1.hand)
             p2_total = sum(sum(card['stats'].values()) for card in self.player2.hand)
             game_winner = self.player1 if p1_total >= p2_total else self.player2
-            
-        #print("\nGame Over!")
-        #print(f"Winner: {game_winner.name}")
-        #print(f"Final Score - {self.player1.name}: {len(self.player1.hand)} cards, {self.player2.name}: {len(self.player2.hand)} cards")
-        
+                    
         return game_winner, self.game_history
 
 def create_hmm(deck: TopTrumpsDeck) -> HiddenMarkovModel:
-    """Create HMM with improved state transitions based on normalized values"""
+    # Create HMM with improved state transitions based on normalized values
     states = []
     n_attributes = len(deck.attributes)
     
@@ -429,11 +438,14 @@ def create_hmm(deck: TopTrumpsDeck) -> HiddenMarkovModel:
         
         # Create emission distribution
         dist = {}
+        # Base probability is 0.4-0.6 based on importance
         base_prob = min(0.6, max(0.4, importance / (n_attributes)))
+        # Remaining probability is equally distributed among other attributes
         remaining_prob = (1.0 - base_prob) / (n_attributes - 1)
         
         for j in range(n_attributes):
             if j == i:
+                # Base probability for the attribute
                 dist[j] = base_prob
             else:
                 dist[j] = remaining_prob
@@ -447,6 +459,7 @@ def create_hmm(deck: TopTrumpsDeck) -> HiddenMarkovModel:
     
     # Initialize transitions
     for i, state1 in enumerate(states):
+        # Get attribute statistics
         attr1 = deck.attributes[i]
         stats1 = deck.attribute_stats[attr1]
         
@@ -463,13 +476,16 @@ def create_hmm(deck: TopTrumpsDeck) -> HiddenMarkovModel:
             else:
                 # Calculate transition weight based on attribute relationships
                 mean_diff = abs(stats1['norm_mean'] - stats2['norm_mean']) / 100.0
+                # Inverse weight based on mean difference
                 weight = 1.0 / (1.0 + mean_diff)
             
+            # Add weight to list
             transition_weights.append(weight)
             total_weight += weight
         
         # Normalize transitions
         for j, weight in enumerate(transition_weights):
+            # Transition probability
             prob = weight / total_weight
             model.add_transition(state1, states[j], prob)
         
@@ -482,12 +498,11 @@ def create_hmm(deck: TopTrumpsDeck) -> HiddenMarkovModel:
     return model
 
 class SilentTopTrumpsGame(TopTrumpsGame):
-    """Completely silent version of the game for training"""
+    # Completely silent version of the game for training
     def _display_round(self, *args, **kwargs):
         pass
 
     def play_round(self, current_player: Player, opponent: Player) -> Tuple[Optional[Player], dict]:
-        """Silent version of play_round without any output"""
         self.round_number += 1
         
         if not self.player1.hand or not self.player2.hand:
@@ -503,23 +518,24 @@ class SilentTopTrumpsGame(TopTrumpsGame):
         p1_val = p1_card['stats'][selected_attr]
         p2_val = p2_card['stats'][selected_attr]
         
-        if abs(p1_val - p2_val) < 1e-10:
+        # Update stats
+        if abs(p1_val - p2_val) < 1e-10: #
             winner = None
             self.player1.update_stats(False, draw=True)
             self.player2.update_stats(False, draw=True)
-        elif p1_val > p2_val:
+        elif p1_val > p2_val: # Player 1 wins
             winner = self.player1
             self.player1.update_stats(True)
             self.player2.update_stats(False)
         else:
-            winner = self.player2
+            winner = self.player2 # Player 2 wins
             self.player1.update_stats(False)
             self.player2.update_stats(True)
             
         if isinstance(current_player, AIPlayer):
             current_player.update_history(selected_attr, winner == current_player)
         
-        round_data = {
+        round_data = { # Record the round data
             'round': self.round_number,
             'current_player': current_player.name,
             'p1_card': p1_card,
@@ -532,7 +548,7 @@ class SilentTopTrumpsGame(TopTrumpsGame):
         return winner, round_data
 
 async def print_training_report(model: HiddenMarkovModel, deck: TopTrumpsDeck, win_rate: float):
-    """Print comprehensive training report for a deck"""
+    # Print comprehensive training report for a deck
     print("\nTraining Report")
     print("=" * 50)
     
@@ -545,7 +561,8 @@ async def print_training_report(model: HiddenMarkovModel, deck: TopTrumpsDeck, w
     print("\nAttribute Analysis:")
     print("-" * 30)
     
-    for state in model.states:
+    # Print attribute statistics
+    for state in model.states: # For each state in the model
         if not hasattr(state, 'name') or state.name not in deck.attributes:
             continue
             
@@ -570,20 +587,20 @@ async def print_training_report(model: HiddenMarkovModel, deck: TopTrumpsDeck, w
         for attr, prob in transitions[:3]:
             print(f"    After using {state.name}, {prob*100:.1f}% chance to use {attr}")
 
-async def train_model(decks: List[str], n_games: int = 1000, epochs: int = 5) -> Dict[str, HiddenMarkovModel]:
-    """Train HMM models with minimal output"""
+async def train_model(decks: List[str], n_games: int = 1000, epochs: int = 10) -> Dict[str, HiddenMarkovModel]:
+    # Train HMM models with minimal output
     deck_models = {}
     
     print("\nAnalyzing decks...")
     for deck_path in decks:
         try:
-            deck = TopTrumpsDeck(deck_path)
+            deck = TopTrumpsDeck(deck_path) # Load the deck
             if not deck.attributes:
                 logger.warning(f"No valid numeric attributes found in {deck_path}")
                 continue
             
-            model = create_hmm(deck)
-            deck_models[deck_path] = model
+            model = create_hmm(deck) # Create the HMM model
+            deck_models[deck_path] = model # Store the model
             print(f"✓ {Path(deck_path).stem}: {len(deck.attributes)} attributes")
             
         except Exception as e:
@@ -601,6 +618,7 @@ async def train_model(decks: List[str], n_games: int = 1000, epochs: int = 5) ->
                 continue
                 
             try:
+                # Load deck and model
                 deck = TopTrumpsDeck(deck_path)
                 model = deck_models[deck_path]
                 deck_name = Path(deck_path).stem
@@ -611,9 +629,12 @@ async def train_model(decks: List[str], n_games: int = 1000, epochs: int = 5) ->
                 print(f"\n{deck_name}: ", end='', flush=True)
                 progress_step = max(1, n_games // 50)  # For 50-character progress bar
                 
+                # Play multiple games
                 for game_num in range(n_games):
-                    p1 = AIPlayer("Player1", {deck_path: model})
-                    p2 = AIPlayer("Player2", None)
+                    # Initialize players. Player 1 uses the model but Player 2 is random
+                    p1 = AIPlayer("Player1", {deck_path: model}) # Use the model for this deck
+                    p2 = AIPlayer("Player2", {deck_path: model}) # Adversary uses the same model
+                    #p2 = AIPlayer("Player2", None) # Random player
                     
                     p1.set_deck(deck)
                     
@@ -654,7 +675,6 @@ async def train_model(decks: List[str], n_games: int = 1000, epochs: int = 5) ->
     return deck_models
 
 async def main():
-    """Main execution"""
     parser = argparse.ArgumentParser(description='Top Trumps Game')
     parser.add_argument('mode', choices=['train', 'demo', 'human'])
     parser.add_argument('deck', nargs='?', help='Deck file for demo/human mode')
@@ -693,6 +713,7 @@ async def main():
             output_path = Path(args.output)
             output_path.mkdir(exist_ok=True)
             
+            # Save models to file
             with open(output_path / 'models.pkl', 'wb') as f:
                 pickle.dump(models, f)
             print("\nModels saved successfully")
